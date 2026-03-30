@@ -33,6 +33,9 @@ using BunEmbedClassMethodFn = uint64_t (*)(void* ctx, uint64_t this_value, void*
 using BunEmbedClassGetterFn = uint64_t (*)(void* ctx, uint64_t this_value, void* native_ptr, void* userdata);
 using BunEmbedClassSetterFn = void (*)(void* ctx, uint64_t this_value, void* native_ptr, uint64_t value, void* userdata);
 using BunEmbedClassConstructorFn = uint64_t (*)(void* ctx, void* klass, int argc, const uint64_t* argv, void* userdata);
+using BunEmbedClassStaticMethodFn = uint64_t (*)(void* ctx, uint64_t this_value, void* userdata, int argc, const uint64_t* argv);
+using BunEmbedClassStaticGetterFn = uint64_t (*)(void* ctx, uint64_t this_value, void* userdata);
+using BunEmbedClassStaticSetterFn = void (*)(void* ctx, uint64_t this_value, uint64_t value, void* userdata);
 using BunEmbedClassFinalizerFn = void (*)(void* native_ptr, void* userdata);
 
 struct BunEmbedClassMethodDescriptor {
@@ -56,6 +59,27 @@ struct BunEmbedClassPropertyDescriptor {
     int dont_delete;
 };
 
+struct BunEmbedClassStaticMethodDescriptor {
+    const char* name;
+    size_t name_len;
+    BunEmbedClassStaticMethodFn callback;
+    void* userdata;
+    int arg_count;
+    int dont_enum;
+    int dont_delete;
+};
+
+struct BunEmbedClassStaticPropertyDescriptor {
+    const char* name;
+    size_t name_len;
+    BunEmbedClassStaticGetterFn getter;
+    BunEmbedClassStaticSetterFn setter;
+    void* userdata;
+    int read_only;
+    int dont_enum;
+    int dont_delete;
+};
+
 struct BunEmbedClassDescriptor {
     const char* name;
     size_t name_len;
@@ -66,6 +90,10 @@ struct BunEmbedClassDescriptor {
     BunEmbedClassConstructorFn constructor;
     void* constructor_userdata;
     int constructor_arg_count;
+    const BunEmbedClassStaticPropertyDescriptor* static_properties;
+    size_t static_property_count;
+    const BunEmbedClassStaticMethodDescriptor* static_methods;
+    size_t static_method_count;
 };
 
 struct BunEmbedArrayBufferInfo {
@@ -102,6 +130,25 @@ struct BunEmbedRegisteredProperty {
     JSObject* setterFunction { nullptr };
 };
 
+struct BunEmbedRegisteredStaticMethod {
+    std::string name;
+    BunEmbedClassStaticMethodFn callback { nullptr };
+    void* userdata { nullptr };
+    unsigned argCount { 0 };
+    unsigned attributes { 0 };
+    JSObject* functionObject { nullptr };
+};
+
+struct BunEmbedRegisteredStaticProperty {
+    std::string name;
+    BunEmbedClassStaticGetterFn getter { nullptr };
+    BunEmbedClassStaticSetterFn setter { nullptr };
+    void* userdata { nullptr };
+    unsigned attributes { 0 };
+    JSObject* getterFunction { nullptr };
+    JSObject* setterFunction { nullptr };
+};
+
 struct BunEmbedRegisteredClass {
     VM* vm { nullptr };
     std::string name;
@@ -114,11 +161,16 @@ struct BunEmbedRegisteredClass {
     JSObject* constructorObject { nullptr };
     std::vector<BunEmbedRegisteredMethod> methods;
     std::vector<BunEmbedRegisteredProperty> properties;
+    std::vector<BunEmbedRegisteredStaticMethod> staticMethods;
+    std::vector<BunEmbedRegisteredStaticProperty> staticProperties;
 };
 
 static std::unordered_map<JSObject*, BunEmbedRegisteredMethod*> s_class_method_map;
 static std::unordered_map<JSObject*, BunEmbedRegisteredProperty*> s_class_getter_map;
 static std::unordered_map<JSObject*, BunEmbedRegisteredProperty*> s_class_setter_map;
+static std::unordered_map<JSObject*, BunEmbedRegisteredStaticMethod*> s_class_static_method_map;
+static std::unordered_map<JSObject*, BunEmbedRegisteredStaticProperty*> s_class_static_getter_map;
+static std::unordered_map<JSObject*, BunEmbedRegisteredStaticProperty*> s_class_static_setter_map;
 
 static WTF::String stringFromStdString(const std::string& value)
 {
@@ -131,6 +183,9 @@ JSC_DECLARE_HOST_FUNCTION(BunEmbed_classConstructorCall);
 JSC_DECLARE_HOST_FUNCTION(BunEmbed_classConstructorConstruct);
 JSC_DECLARE_HOST_FUNCTION(BunEmbed_classPropertyGetterDispatcher);
 JSC_DECLARE_HOST_FUNCTION(BunEmbed_classPropertySetterDispatcher);
+JSC_DECLARE_HOST_FUNCTION(BunEmbed_classStaticMethodDispatcher);
+JSC_DECLARE_HOST_FUNCTION(BunEmbed_classStaticPropertyGetterDispatcher);
+JSC_DECLARE_HOST_FUNCTION(BunEmbed_classStaticPropertySetterDispatcher);
 
 class JSBunClassConstructor final : public JSC::InternalFunction {
 public:
@@ -446,6 +501,71 @@ JSC_DEFINE_HOST_FUNCTION(BunEmbed_classMethodDispatcher, (JSGlobalObject * globa
         method->userdata));
 }
 
+JSC_DEFINE_HOST_FUNCTION(BunEmbed_classStaticPropertyGetterDispatcher, (JSGlobalObject * globalObject, CallFrame* callFrame))
+{
+    auto* callee = jsDynamicCast<JSObject*>(callFrame->jsCallee());
+    if (!callee)
+        return JSValue::encode(jsUndefined());
+
+    auto propertyIt = s_class_static_getter_map.find(callee);
+    if (propertyIt == s_class_static_getter_map.end() || !propertyIt->second || !propertyIt->second->getter)
+        return JSValue::encode(jsUndefined());
+
+    const BunEmbedRegisteredStaticProperty* property = propertyIt->second;
+    return static_cast<EncodedJSValue>(property->getter(
+        static_cast<void*>(globalObject),
+        static_cast<uint64_t>(JSValue::encode(callFrame->thisValue())),
+        property->userdata));
+}
+
+JSC_DEFINE_HOST_FUNCTION(BunEmbed_classStaticPropertySetterDispatcher, (JSGlobalObject * globalObject, CallFrame* callFrame))
+{
+    auto* callee = jsDynamicCast<JSObject*>(callFrame->jsCallee());
+    if (!callee)
+        return JSValue::encode(jsUndefined());
+
+    auto propertyIt = s_class_static_setter_map.find(callee);
+    if (propertyIt == s_class_static_setter_map.end() || !propertyIt->second || !propertyIt->second->setter)
+        return JSValue::encode(jsUndefined());
+
+    const BunEmbedRegisteredStaticProperty* property = propertyIt->second;
+    if ((property->attributes & PropertyAttribute::ReadOnly))
+        return JSValue::encode(jsUndefined());
+
+    JSValue value = callFrame->argumentCount() > 0 ? callFrame->uncheckedArgument(0) : jsUndefined();
+    property->setter(
+        static_cast<void*>(globalObject),
+        static_cast<uint64_t>(JSValue::encode(callFrame->thisValue())),
+        static_cast<uint64_t>(JSValue::encode(value)),
+        property->userdata);
+    return JSValue::encode(jsUndefined());
+}
+
+JSC_DEFINE_HOST_FUNCTION(BunEmbed_classStaticMethodDispatcher, (JSGlobalObject * globalObject, CallFrame* callFrame))
+{
+    auto* callee = jsDynamicCast<JSObject*>(callFrame->jsCallee());
+    if (!callee)
+        return JSValue::encode(jsUndefined());
+
+    auto methodIt = s_class_static_method_map.find(callee);
+    if (methodIt == s_class_static_method_map.end() || !methodIt->second || !methodIt->second->callback)
+        return JSValue::encode(jsUndefined());
+
+    const BunEmbedRegisteredStaticMethod* method = methodIt->second;
+    const size_t argCount = callFrame->argumentCount();
+    WTF::Vector<uint64_t, 8> encodedArgs(argCount);
+    for (size_t i = 0; i < argCount; ++i) {
+        encodedArgs[i] = static_cast<uint64_t>(JSValue::encode(callFrame->uncheckedArgument(i)));
+    }
+
+    return static_cast<EncodedJSValue>(method->callback(
+        static_cast<void*>(globalObject),
+        static_cast<uint64_t>(JSValue::encode(callFrame->thisValue())),
+        method->userdata,
+        static_cast<int>(argCount),
+        argCount == 0 ? nullptr : encodedArgs.mutableSpan().data()));
+}
+
 static void destroyRegisteredClass(BunEmbedRegisteredClass* registeredClass)
 {
     if (!registeredClass)
@@ -463,6 +583,18 @@ static void destroyRegisteredClass(BunEmbedRegisteredClass* registeredClass)
             s_class_getter_map.erase(property.getterFunction);
         if (property.setterFunction)
             s_class_setter_map.erase(property.setterFunction);
+    }
+
+    for (auto& method : registeredClass->staticMethods) {
+        if (method.functionObject)
+            s_class_static_method_map.erase(method.functionObject);
+    }
+
+    for (auto& property : registeredClass->staticProperties) {
+        if (property.getterFunction)
+            s_class_static_getter_map.erase(property.getterFunction);
+        if (property.setterFunction)
+            s_class_static_setter_map.erase(property.setterFunction);
     }
 
     if (registeredClass->constructorObject)
@@ -895,6 +1027,12 @@ extern "C" BunEmbedRegisteredClass* BunEmbed__registerClass(
         return nullptr;
     if (descriptor->method_count > 0 && !descriptor->methods)
         return nullptr;
+    if (descriptor->static_property_count > 0 && !descriptor->static_properties)
+        return nullptr;
+    if (descriptor->static_method_count > 0 && !descriptor->static_methods)
+        return nullptr;
+    if ((descriptor->static_property_count > 0 || descriptor->static_method_count > 0) && !descriptor->constructor)
+        return nullptr;
     if (parent && !isVMCompatible(globalObject, parent))
         return nullptr;
 
@@ -926,6 +1064,8 @@ extern "C" BunEmbedRegisteredClass* BunEmbed__registerClass(
 
         registeredClass->constructorObject = constructor;
         gcProtect(constructor);
+        if (parent && parent->constructorObject)
+            constructor->setPrototypeDirect(vm, parent->constructorObject);
         prototype->putDirect(vm, vm.propertyNames->constructor, constructor, JSC::PropertyAttribute::DontEnum | 0);
     }
 
@@ -984,6 +1124,65 @@ extern "C" BunEmbedRegisteredClass* BunEmbed__registerClass(
 
         s_class_method_map[dst.functionObject] = &dst;
         prototype->putDirect(vm, Identifier::fromString(vm, methodName), dst.functionObject, dst.attributes);
+    }
+
+    if (registeredClass->constructorObject) {
+        registeredClass->staticProperties.reserve(descriptor->static_property_count);
+        for (size_t i = 0; i < descriptor->static_property_count; ++i) {
+            const auto& property = descriptor->static_properties[i];
+            if (!property.name || property.name_len == 0 || !property.getter)
+                goto fail;
+
+            WTF::String propertyName = WTF::String::fromUTF8(std::span { property.name, property.name_len });
+            if (propertyName.isNull())
+                goto fail;
+
+            auto& dst = registeredClass->staticProperties.emplace_back();
+            dst.name.assign(property.name, property.name_len);
+            dst.getter = property.getter;
+            dst.setter = property.setter;
+            dst.userdata = property.userdata;
+            dst.attributes = propertyAttributes(property.read_only, property.dont_enum, property.dont_delete);
+
+            dst.getterFunction = JSFunction::create(vm, globalObject, 0, propertyName, BunEmbed_classStaticPropertyGetterDispatcher, ImplementationVisibility::Public);
+            if (!dst.getterFunction)
+                goto fail;
+            s_class_static_getter_map[dst.getterFunction] = &dst;
+
+            if (property.setter && !property.read_only) {
+                dst.setterFunction = JSFunction::create(vm, globalObject, 1, propertyName, BunEmbed_classStaticPropertySetterDispatcher, ImplementationVisibility::Public);
+                if (!dst.setterFunction)
+                    goto fail;
+                s_class_static_setter_map[dst.setterFunction] = &dst;
+            }
+
+            auto* accessor = GetterSetter::create(vm, globalObject, dst.getterFunction, dst.setterFunction);
+            registeredClass->constructorObject->putDirectAccessor(globalObject, Identifier::fromString(vm, propertyName), accessor, PropertyAttribute::Accessor | dst.attributes);
+        }
+
+        registeredClass->staticMethods.reserve(descriptor->static_method_count);
+        for (size_t i = 0; i < descriptor->static_method_count; ++i) {
+            const auto& method = descriptor->static_methods[i];
+            if (!method.name || method.name_len == 0 || !method.callback)
+                goto fail;
+
+            WTF::String methodName = WTF::String::fromUTF8(std::span { method.name, method.name_len });
+            if (methodName.isNull())
+                goto fail;
+
+            auto& dst = registeredClass->staticMethods.emplace_back();
+            dst.name.assign(method.name, method.name_len);
+            dst.callback = method.callback;
+            dst.userdata = method.userdata;
+            dst.argCount = method.arg_count > 0 ? static_cast<unsigned>(method.arg_count) : 0;
+            dst.attributes = propertyAttributes(0, method.dont_enum, method.dont_delete);
+            dst.functionObject = JSFunction::create(vm, globalObject, dst.argCount, methodName, BunEmbed_classStaticMethodDispatcher, ImplementationVisibility::Public);
+            if (!dst.functionObject)
+                goto fail;
+
+            s_class_static_method_map[dst.functionObject] = &dst;
+            registeredClass->constructorObject->putDirect(vm, Identifier::fromString(vm, methodName), dst.functionObject, dst.attributes);
+        }
     }
 
     return registeredClass.release();

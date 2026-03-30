@@ -25,6 +25,8 @@ typedef struct {
     char text[64];
 } NativeText;
 
+static char view_static_tag[64] = "view-static";
+
 static void text_assign_utf8(NativeText* text, const char* utf8, size_t len)
 {
     if (!text || !utf8) return;
@@ -126,6 +128,39 @@ static BunValue text_measure(BunContext* ctx, BunValue this_value, void* native_
     return text ? bun_int32((int32_t)strlen(text->text)) : BUN_UNDEFINED;
 }
 
+static BunValue view_static_describe(BunContext* ctx, BunValue this_value, void* userdata, int argc, const BunValue* argv)
+{
+    (void)userdata;
+    (void)argc;
+    (void)argv;
+    return bun_get(ctx, this_value, "name", 4);
+}
+
+static BunValue view_static_get_tag(BunContext* ctx, BunValue this_value, void* userdata)
+{
+    (void)this_value;
+    (void)userdata;
+    return bun_string(ctx, view_static_tag, strlen(view_static_tag));
+}
+
+static void view_static_assign_tag(BunContext* ctx, BunValue value)
+{
+    size_t len = 0;
+    char* utf8 = bun_to_utf8(ctx, value, &len);
+    if (!utf8) return;
+    if (len >= sizeof(view_static_tag)) len = sizeof(view_static_tag) - 1;
+    memcpy(view_static_tag, utf8, len);
+    view_static_tag[len] = '\0';
+    free(utf8);
+}
+
+static void view_static_set_tag(BunContext* ctx, BunValue this_value, BunValue value, void* userdata)
+{
+    (void)this_value;
+    (void)userdata;
+    view_static_assign_tag(ctx, value);
+}
+
 static void native_view_finalize(void* native_ptr, void* userdata)
 {
     const char* class_name = (const char*)userdata;
@@ -167,6 +202,14 @@ static const BunClassMethodDescriptor VIEW_METHODS[] = {
     { "moveBy", 6, view_move_by, NULL, 2, 0, 0 },
 };
 
+static const BunClassStaticPropertyDescriptor VIEW_STATIC_PROPERTIES[] = {
+    { "tag", 3, view_static_get_tag, view_static_set_tag, NULL, 0, 0, 0 },
+};
+
+static const BunClassStaticMethodDescriptor VIEW_STATIC_METHODS[] = {
+    { "describe", 8, view_static_describe, NULL, 0, 0, 0 },
+};
+
 static const BunClassDescriptor VIEW_CLASS = {
     "View",
     4,
@@ -177,6 +220,10 @@ static const BunClassDescriptor VIEW_CLASS = {
     view_construct,
     NULL,
     2,
+    VIEW_STATIC_PROPERTIES,
+    sizeof(VIEW_STATIC_PROPERTIES) / sizeof(VIEW_STATIC_PROPERTIES[0]),
+    VIEW_STATIC_METHODS,
+    sizeof(VIEW_STATIC_METHODS) / sizeof(VIEW_STATIC_METHODS[0]),
 };
 
 static const BunClassPropertyDescriptor TEXT_PROPERTIES[] = {
@@ -197,6 +244,10 @@ static const BunClassDescriptor TEXT_CLASS = {
     text_construct,
     NULL,
     3,
+    NULL,
+    0,
+    NULL,
+    0,
 };
 
 static void counter_finalize(void* userdata)
@@ -388,7 +439,13 @@ int main(void)
         "console.log('fromCtor instanceof View?', fromCtor instanceof View);"
         "console.log('fromCtor.measure() =', fromCtor.measure());"
         "console.log('fromCtor.moveBy(1, 2) =', fromCtor.moveBy(1, 2));"
-        "console.log('fromCtor.constructor === Text?', fromCtor.constructor === Text);");
+        "console.log('fromCtor.constructor === Text?', fromCtor.constructor === Text);"
+        "console.log('View.describe() =', View.describe());"
+        "console.log('Text.describe() =', Text.describe());"
+        "console.log('View.tag =', View.tag);"
+        "Text.tag = 'updated-static';"
+        "console.log('View.tag after Text.tag set =', View.tag);"
+        "console.log('Text.tag =', Text.tag);");
     if (!r.success) fprintf(stderr, "Error: %s\n", r.error);
 
     r = bun_eval_string(ctx, "console.log(nativeGreet('Bun'))");

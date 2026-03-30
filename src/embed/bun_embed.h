@@ -79,6 +79,18 @@ typedef void (*BunClassSetterFn)(BunContext* ctx, BunValue this_value, void* nat
 typedef BunValue (*BunClassConstructorFn)(BunContext* ctx, BunClass* klass,
     int argc, const BunValue* argv, void* userdata);
 
+/// Native static method callback for bun_class_register().
+typedef BunValue (*BunClassStaticMethodFn)(BunContext* ctx, BunValue this_value,
+    void* userdata, int argc, const BunValue* argv);
+
+/// Native static property getter callback for bun_class_register().
+typedef BunValue (*BunClassStaticGetterFn)(BunContext* ctx, BunValue this_value,
+    void* userdata);
+
+/// Native static property setter callback for bun_class_register().
+typedef void (*BunClassStaticSetterFn)(BunContext* ctx, BunValue this_value,
+    BunValue value, void* userdata);
+
 /// Finalizer callback for bun_class_new().
 ///
 /// Runs at most once, either when bun_class_dispose() is called or when the JS
@@ -109,6 +121,27 @@ typedef struct {
 typedef struct {
     const char* name;
     size_t name_len;
+    BunClassStaticMethodFn callback;
+    void* userdata;
+    int arg_count;
+    int dont_enum;
+    int dont_delete;
+} BunClassStaticMethodDescriptor;
+
+typedef struct {
+    const char* name;
+    size_t name_len;
+    BunClassStaticGetterFn getter;
+    BunClassStaticSetterFn setter;
+    void* userdata;
+    int read_only;
+    int dont_enum;
+    int dont_delete;
+} BunClassStaticPropertyDescriptor;
+
+typedef struct {
+    const char* name;
+    size_t name_len;
     const BunClassPropertyDescriptor* properties;
     size_t property_count;
     const BunClassMethodDescriptor* methods;
@@ -116,6 +149,10 @@ typedef struct {
     BunClassConstructorFn constructor;
     void* constructor_userdata;
     int constructor_arg_count;
+    const BunClassStaticPropertyDescriptor* static_properties;
+    size_t static_property_count;
+    const BunClassStaticMethodDescriptor* static_methods;
+    size_t static_method_count;
 } BunClassDescriptor;
 
 /// Predefined immediate values in JSValue64 mode.

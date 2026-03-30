@@ -25,11 +25,7 @@
   "git.autoRepositoryDetection": "openEditors",
   "git.ignoreSubmodules": true,
   "git.ignoreLimitWarning": true,
-  "zig.buildOnSaveArgs": [
-    "-Dgenerated-code=./build/debug/codegen",
-    "--watch",
-    "-fincremental"
-  ],
+  "zig.buildOnSaveArgs": ["-Dgenerated-code=./build/debug/codegen", "--watch", "-fincremental"],
   "zig.formattingProvider": "zls",
   // "zig.zls.enableInlayHints": false,
   "[zig]": {
@@ -163,4 +159,5 @@
   "git.detectSubmodules": false,
   "bun.test.customScript": "./build/debug/bun-debug test",
   "zig.libPath": "${workspaceFolder}/vendor/zig/lib",
+  "cSpell.words": ["Finalizer"],
 }

@@ -27,6 +27,9 @@ const BunClassMethodFn = *const fn (?*BunContext, BunValue, ?*anyopaque, c_int, 
 const BunClassGetterFn = *const fn (?*BunContext, BunValue, ?*anyopaque, ?*anyopaque) callconv(.c) BunValue;
 const BunClassSetterFn = *const fn (?*BunContext, BunValue, ?*anyopaque, BunValue, ?*anyopaque) callconv(.c) void;
 const BunClassConstructorFn = *const fn (?*BunContext, ?*BunClass, c_int, ?[*]const BunValue, ?*anyopaque) callconv(.c) BunValue;
+const BunClassStaticMethodFn = *const fn (?*BunContext, BunValue, ?*anyopaque, c_int, ?[*]const BunValue) callconv(.c) BunValue;
+const BunClassStaticGetterFn = *const fn (?*BunContext, BunValue, ?*anyopaque) callconv(.c) BunValue;
+const BunClassStaticSetterFn = *const fn (?*BunContext, BunValue, BunValue, ?*anyopaque) callconv(.c) void;
 const BunClassFinalizerFn = *const fn (?*anyopaque, ?*anyopaque) callconv(.c) void;
 
 const BunClassMethodDescriptor = extern struct {
@@ -50,6 +53,27 @@ const BunClassPropertyDescriptor = extern struct {
     dont_delete: c_int,
 };
 
+const BunClassStaticMethodDescriptor = extern struct {
+    name: ?[*]const u8,
+    name_len: usize,
+    callback: ?BunClassStaticMethodFn,
+    userdata: ?*anyopaque,
+    arg_count: c_int,
+    dont_enum: c_int,
+    dont_delete: c_int,
+};
+
+const BunClassStaticPropertyDescriptor = extern struct {
+    name: ?[*]const u8,
+    name_len: usize,
+    getter: ?BunClassStaticGetterFn,
+    setter: ?BunClassStaticSetterFn,
+    userdata: ?*anyopaque,
+    read_only: c_int,
+    dont_enum: c_int,
+    dont_delete: c_int,
+};
+
 const BunClassDescriptor = extern struct {
     name: ?[*]const u8,
     name_len: usize,
@@ -60,6 +84,10 @@ const BunClassDescriptor = extern struct {
     constructor: ?BunClassConstructorFn,
     constructor_userdata: ?*anyopaque,
     constructor_arg_count: c_int,
+    static_properties: ?[*]const BunClassStaticPropertyDescriptor,
+    static_property_count: usize,
+    static_methods: ?[*]const BunClassStaticMethodDescriptor,
+    static_method_count: usize,
 };
 
 const BunArrayBufferInfo = extern struct {
