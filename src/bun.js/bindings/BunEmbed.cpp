@@ -2,7 +2,10 @@
 #include "helpers.h"
 
 #include "JavaScriptCore/CustomGetterSetter.h"
+#include "JavaScriptCore/FunctionPrototype.h"
+#include "JavaScriptCore/GetterSetter.h"
 #include "JavaScriptCore/Identifier.h"
+#include "JavaScriptCore/InternalFunction.h"
 #include "JavaScriptCore/JSObject.h"
 #include "JavaScriptCore/JSFunction.h"
 #include "JavaScriptCore/ObjectConstructor.h"
@@ -29,6 +32,7 @@ using BunEmbedFinalizerFn = void (*)(void* userdata);
 using BunEmbedClassMethodFn = uint64_t (*)(void* ctx, uint64_t this_value, void* native_ptr, int argc, const uint64_t* argv, void* userdata);
 using BunEmbedClassGetterFn = uint64_t (*)(void* ctx, uint64_t this_value, void* native_ptr, void* userdata);
 using BunEmbedClassSetterFn = void (*)(void* ctx, uint64_t this_value, void* native_ptr, uint64_t value, void* userdata);
+using BunEmbedClassConstructorFn = uint64_t (*)(void* ctx, void* klass, int argc, const uint64_t* argv, void* userdata);
 using BunEmbedClassFinalizerFn = void (*)(void* native_ptr, void* userdata);
 
 struct BunEmbedClassMethodDescriptor {
@@ -59,6 +63,9 @@ struct BunEmbedClassDescriptor {
     size_t property_count;
     const BunEmbedClassMethodDescriptor* methods;
     size_t method_count;
+    BunEmbedClassConstructorFn constructor;
+    void* constructor_userdata;
+    int constructor_arg_count;
 };
 
 struct BunEmbedArrayBufferInfo {
@@ -91,6 +98,8 @@ struct BunEmbedRegisteredProperty {
     BunEmbedClassSetterFn setter { nullptr };
     void* userdata { nullptr };
     unsigned attributes { 0 };
+    JSObject* getterFunction { nullptr };
+    JSObject* setterFunction { nullptr };
 };
 
 struct BunEmbedRegisteredClass {
@@ -99,11 +108,130 @@ struct BunEmbedRegisteredClass {
     BunEmbedRegisteredClass* parent { nullptr };
     JSObject* prototype { nullptr };
     Structure* instanceStructure { nullptr };
+    BunEmbedClassConstructorFn constructor { nullptr };
+    void* constructorUserdata { nullptr };
+    unsigned constructorArgCount { 0 };
+    JSObject* constructorObject { nullptr };
     std::vector<BunEmbedRegisteredMethod> methods;
     std::vector<BunEmbedRegisteredProperty> properties;
 };
 
 static std::unordered_map<JSObject*, BunEmbedRegisteredMethod*> s_class_method_map;
+static std::unordered_map<JSObject*, BunEmbedRegisteredProperty*> s_class_getter_map;
+static std::unordered_map<JSObject*, BunEmbedRegisteredProperty*> s_class_setter_map;
+
+static WTF::String stringFromStdString(const std::string& value)
+{
+    if (value.empty())
+        return ""_s;
+    return WTF::String::fromUTF8(std::span { value.data(), value.size() });
+}
+
+JSC_DECLARE_HOST_FUNCTION(BunEmbed_classConstructorCall);
+JSC_DECLARE_HOST_FUNCTION(BunEmbed_classConstructorConstruct);
+JSC_DECLARE_HOST_FUNCTION(BunEmbed_classPropertyGetterDispatcher);
+JSC_DECLARE_HOST_FUNCTION(BunEmbed_classPropertySetterDispatcher);
+
+class JSBunClassConstructor final : public JSC::InternalFunction {
+public:
+    using Base = JSC::InternalFunction;
+    static constexpr unsigned StructureFlags = Base::StructureFlags;
+
+    static JSBunClassConstructor* create(JSC::VM& vm, JSC::Structure* structure, BunEmbedRegisteredClass* registeredClass, JSC::JSObject* prototype)
+    {
+        auto* constructor = new (NotNull, JSC::allocateCell<JSBunClassConstructor>(vm)) JSBunClassConstructor(vm, structure, registeredClass);
+        constructor->finishCreation(vm, prototype);
+        return constructor;
+    }
+
+    DECLARE_INFO;
+
+    template<typename CellType, JSC::SubspaceAccess>
+    static JSC::GCClient::IsoSubspace* subspaceFor(JSC::VM& vm)
+    {
+        return &vm.internalFunctionSpace();
+    }
+
+    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* globalObject, JSC::JSValue prototype)
+    {
+        return JSC::Structure::create(vm, globalObject, prototype, JSC::TypeInfo(JSC::InternalFunctionType, StructureFlags), info());
+    }
+
+    BunEmbedRegisteredClass* registeredClass() const { return m_registeredClass; }
+
+private:
+    JSBunClassConstructor(JSC::VM& vm, JSC::Structure* structure, BunEmbedRegisteredClass* registeredClass)
+        : Base(vm, structure, BunEmbed_classConstructorCall, BunEmbed_classConstructorConstruct)
+        , m_registeredClass(registeredClass)
+    {
+    }
+
+    void finishCreation(JSC::VM& vm, JSC::JSObject* prototype)
+    {
+        WTF::String name = m_registeredClass ? stringFromStdString(m_registeredClass->name) : ""_s;
+        if (name.isEmpty())
+            name = "BunClass"_s;
+
+        Base::finishCreation(vm, m_registeredClass ? m_registeredClass->constructorArgCount : 0, name);
+        putDirectWithoutTransition(vm, vm.propertyNames->prototype, prototype, JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::DontDelete | JSC::PropertyAttribute::ReadOnly);
+    }
+
+    BunEmbedRegisteredClass* m_registeredClass { nullptr };
+};
+
+JSC_DEFINE_HOST_FUNCTION(BunEmbed_classConstructorCall, (JSGlobalObject * globalObject, CallFrame* callFrame))
+{
+    auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
+    throwTypeError(globalObject, scope, "Class constructor cannot be invoked without 'new'"_s);
+    return {};
+}
+
+JSC_DEFINE_HOST_FUNCTION(BunEmbed_classConstructorConstruct, (JSGlobalObject * globalObject, CallFrame* callFrame))
+{
+    VM& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    auto* constructor = jsDynamicCast<JSBunClassConstructor*>(callFrame->jsCallee());
+    if (!constructor) {
+        throwTypeError(globalObject, scope, "Expected Bun embed class constructor"_s);
+        return {};
+    }
+
+    auto* registeredClass = constructor->registeredClass();
+    if (!registeredClass || !registeredClass->constructor) {
+        throwTypeError(globalObject, scope, "Class constructor is not available"_s);
+        return {};
+    }
+
+    const size_t argCount = callFrame->argumentCount();
+    WTF::Vector<uint64_t, 8> encodedArgs(argCount);
+    for (size_t i = 0; i < argCount; ++i)
+        encodedArgs[i] = static_cast<uint64_t>(JSValue::encode(callFrame->uncheckedArgument(i)));
+
+    JSValue result = JSValue::decode(registeredClass->constructor(
+        static_cast<void*>(globalObject),
+        static_cast<void*>(registeredClass),
+        static_cast<int>(argCount),
+        argCount == 0 ? nullptr : encodedArgs.mutableSpan().data(),
+        registeredClass->constructorUserdata));
+
+    if (!result.isObject()) {
+        throwTypeError(globalObject, scope, "Class constructor must return an object"_s);
+        return {};
+    }
+
+    JSValue newTarget = callFrame->newTarget();
+    if (newTarget && newTarget.isObject() && newTarget.getObject() != constructor) {
+        JSValue prototype = newTarget.get(globalObject, vm.propertyNames->prototype);
+        RETURN_IF_EXCEPTION(scope, {});
+        if (auto* prototypeObject = prototype.getObject())
+            result.getObject()->setPrototypeDirect(vm, prototypeObject);
+    }
+
+    RELEASE_AND_RETURN(scope, JSValue::encode(result));
+}
+
+const ClassInfo JSBunClassConstructor::s_info = { "Function"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSBunClassConstructor) };
 
 static bool stringEqualsPropertyName(const std::string& name, PropertyName propertyName)
 {
@@ -246,43 +374,46 @@ static unsigned propertyAttributes(int readOnly, int dontEnum, int dontDelete)
     return attributes;
 }
 
-static BunEmbedRegisteredProperty* findProperty(JSBunClassInstance* instance, PropertyName propertyName)
+JSC_DEFINE_HOST_FUNCTION(BunEmbed_classPropertyGetterDispatcher, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
-    for (auto* current = instance->registeredClass(); current; current = current->parent) {
-        for (auto& property : current->properties) {
-            if (stringEqualsPropertyName(property.name, propertyName))
-                return &property;
-        }
-    }
+    auto* callee = jsDynamicCast<JSObject*>(callFrame->jsCallee());
+    if (!callee)
+        return JSValue::encode(jsUndefined());
 
-    return nullptr;
-}
+    auto propertyIt = s_class_getter_map.find(callee);
+    if (propertyIt == s_class_getter_map.end() || !propertyIt->second || !propertyIt->second->getter)
+        return JSValue::encode(jsUndefined());
 
-JSC_DEFINE_CUSTOM_GETTER(BunEmbed_classGetter, (JSGlobalObject * globalObject, EncodedJSValue thisValue, PropertyName propertyName))
-{
-    auto* instance = jsDynamicCast<JSBunClassInstance*>(JSValue::decode(thisValue));
+    auto* instance = jsDynamicCast<JSBunClassInstance*>(callFrame->thisValue());
     if (!instance || instance->isDisposed())
         return JSValue::encode(jsUndefined());
 
-    auto* property = findProperty(instance, propertyName);
-    if (!property || !property->getter)
-        return JSValue::encode(jsUndefined());
+    const BunEmbedRegisteredProperty* property = propertyIt->second;
 
-    return static_cast<EncodedJSValue>(property->getter(static_cast<void*>(globalObject), static_cast<uint64_t>(thisValue), instance->nativePtr(), property->userdata));
+    return static_cast<EncodedJSValue>(property->getter(static_cast<void*>(globalObject), static_cast<uint64_t>(JSValue::encode(callFrame->thisValue())), instance->nativePtr(), property->userdata));
 }
 
-JSC_DEFINE_CUSTOM_SETTER(BunEmbed_classSetter, (JSGlobalObject * globalObject, EncodedJSValue thisValue, EncodedJSValue value, PropertyName propertyName))
+JSC_DEFINE_HOST_FUNCTION(BunEmbed_classPropertySetterDispatcher, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
-    auto* instance = jsDynamicCast<JSBunClassInstance*>(JSValue::decode(thisValue));
+    auto* callee = jsDynamicCast<JSObject*>(callFrame->jsCallee());
+    if (!callee)
+        return JSValue::encode(jsUndefined());
+
+    auto propertyIt = s_class_setter_map.find(callee);
+    if (propertyIt == s_class_setter_map.end() || !propertyIt->second || !propertyIt->second->setter)
+        return JSValue::encode(jsUndefined());
+
+    auto* instance = jsDynamicCast<JSBunClassInstance*>(callFrame->thisValue());
     if (!instance || instance->isDisposed())
-        return false;
+        return JSValue::encode(jsUndefined());
 
-    auto* property = findProperty(instance, propertyName);
-    if (!property || !property->setter || (property->attributes & PropertyAttribute::ReadOnly))
-        return false;
+    const BunEmbedRegisteredProperty* property = propertyIt->second;
+    if ((property->attributes & PropertyAttribute::ReadOnly))
+        return JSValue::encode(jsUndefined());
 
-    property->setter(static_cast<void*>(globalObject), static_cast<uint64_t>(thisValue), instance->nativePtr(), static_cast<uint64_t>(value), property->userdata);
-    return true;
+    JSValue value = callFrame->argumentCount() > 0 ? callFrame->uncheckedArgument(0) : jsUndefined();
+    property->setter(static_cast<void*>(globalObject), static_cast<uint64_t>(JSValue::encode(callFrame->thisValue())), instance->nativePtr(), static_cast<uint64_t>(JSValue::encode(value)), property->userdata);
+    return JSValue::encode(jsUndefined());
 }
 
 JSC_DEFINE_HOST_FUNCTION(BunEmbed_classMethodDispatcher, (JSGlobalObject * globalObject, CallFrame* callFrame))
@@ -327,6 +458,15 @@ static void destroyRegisteredClass(BunEmbedRegisteredClass* registeredClass)
             s_class_method_map.erase(method.functionObject);
     }
 
+    for (auto& property : registeredClass->properties) {
+        if (property.getterFunction)
+            s_class_getter_map.erase(property.getterFunction);
+        if (property.setterFunction)
+            s_class_setter_map.erase(property.setterFunction);
+    }
+
+    if (registeredClass->constructorObject)
+        gcUnprotect(registeredClass->constructorObject);
     if (registeredClass->instanceStructure)
         gcUnprotect(registeredClass->instanceStructure);
     if (registeredClass->prototype)
@@ -764,6 +904,9 @@ extern "C" BunEmbedRegisteredClass* BunEmbed__registerClass(
     registeredClass->vm = &vm;
     registeredClass->parent = parent;
     registeredClass->name.assign(descriptor->name, descriptor->name_len);
+    registeredClass->constructor = descriptor->constructor;
+    registeredClass->constructorUserdata = descriptor->constructor_userdata;
+    registeredClass->constructorArgCount = descriptor->constructor_arg_count > 0 ? static_cast<unsigned>(descriptor->constructor_arg_count) : 0;
 
     JSObject* parentPrototype = parent ? parent->prototype : globalObject->objectPrototype();
     JSObject* prototype = JSC::constructEmptyObject(globalObject, parentPrototype);
@@ -775,6 +918,16 @@ extern "C" BunEmbedRegisteredClass* BunEmbed__registerClass(
 
     gcProtect(prototype);
     gcProtect(registeredClass->instanceStructure);
+
+    if (registeredClass->constructor) {
+        auto* constructor = JSBunClassConstructor::create(vm, JSBunClassConstructor::createStructure(vm, globalObject, globalObject->functionPrototype()), registeredClass.get(), prototype);
+        if (!constructor)
+            goto fail;
+
+        registeredClass->constructorObject = constructor;
+        gcProtect(constructor);
+        prototype->putDirect(vm, vm.propertyNames->constructor, constructor, JSC::PropertyAttribute::DontEnum | 0);
+    }
 
     registeredClass->properties.reserve(descriptor->property_count);
     for (size_t i = 0; i < descriptor->property_count; ++i) {
@@ -793,8 +946,20 @@ extern "C" BunEmbedRegisteredClass* BunEmbed__registerClass(
         dst.userdata = property.userdata;
         dst.attributes = propertyAttributes(property.read_only, property.dont_enum, property.dont_delete);
 
-        auto* accessor = CustomGetterSetter::create(vm, BunEmbed_classGetter, property.setter && !property.read_only ? BunEmbed_classSetter : nullptr);
-        prototype->putDirectCustomAccessor(vm, Identifier::fromString(vm, propertyName), accessor, dst.attributes);
+        dst.getterFunction = JSFunction::create(vm, globalObject, 0, propertyName, BunEmbed_classPropertyGetterDispatcher, ImplementationVisibility::Public);
+        if (!dst.getterFunction)
+            goto fail;
+        s_class_getter_map[dst.getterFunction] = &dst;
+
+        if (property.setter && !property.read_only) {
+            dst.setterFunction = JSFunction::create(vm, globalObject, 1, propertyName, BunEmbed_classPropertySetterDispatcher, ImplementationVisibility::Public);
+            if (!dst.setterFunction)
+                goto fail;
+            s_class_setter_map[dst.setterFunction] = &dst;
+        }
+
+        auto* accessor = GetterSetter::create(vm, globalObject, dst.getterFunction, dst.setterFunction);
+        prototype->putDirectAccessor(globalObject, Identifier::fromString(vm, propertyName), accessor, PropertyAttribute::Accessor | dst.attributes);
     }
 
     registeredClass->methods.reserve(descriptor->method_count);
@@ -911,6 +1076,15 @@ extern "C" JSC::EncodedJSValue BunEmbed__classPrototype(
     if (!globalObject || !isVMCompatible(globalObject, registeredClass) || !registeredClass->prototype)
         return {};
     return JSValue::encode(registeredClass->prototype);
+}
+
+extern "C" JSC::EncodedJSValue BunEmbed__classConstructor(
+    JSGlobalObject* globalObject,
+    BunEmbedRegisteredClass* registeredClass)
+{
+    if (!globalObject || !isVMCompatible(globalObject, registeredClass) || !registeredClass->constructorObject)
+        return {};
+    return JSValue::encode(registeredClass->constructorObject);
 }
 
 }

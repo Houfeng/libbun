@@ -349,6 +349,7 @@ BUN_1.2 {
   bun_instanceof_class;
   bun_class_dispose;
   bun_class_prototype;
+  bun_class_constructor;
   bun_is_undefined;
   bun_is_null;
   bun_is_bool;

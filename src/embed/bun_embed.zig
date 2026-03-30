@@ -26,6 +26,7 @@ const BunFinalizerFn = *const fn (?*anyopaque) callconv(.c) void;
 const BunClassMethodFn = *const fn (?*BunContext, BunValue, ?*anyopaque, c_int, ?[*]const BunValue, ?*anyopaque) callconv(.c) BunValue;
 const BunClassGetterFn = *const fn (?*BunContext, BunValue, ?*anyopaque, ?*anyopaque) callconv(.c) BunValue;
 const BunClassSetterFn = *const fn (?*BunContext, BunValue, ?*anyopaque, BunValue, ?*anyopaque) callconv(.c) void;
+const BunClassConstructorFn = *const fn (?*BunContext, ?*BunClass, c_int, ?[*]const BunValue, ?*anyopaque) callconv(.c) BunValue;
 const BunClassFinalizerFn = *const fn (?*anyopaque, ?*anyopaque) callconv(.c) void;
 
 const BunClassMethodDescriptor = extern struct {
@@ -56,6 +57,9 @@ const BunClassDescriptor = extern struct {
     property_count: usize,
     methods: ?[*]const BunClassMethodDescriptor,
     method_count: usize,
+    constructor: ?BunClassConstructorFn,
+    constructor_userdata: ?*anyopaque,
+    constructor_arg_count: c_int,
 };
 
 const BunArrayBufferInfo = extern struct {
@@ -110,25 +114,50 @@ const BunRuntime = struct {
     /// Runtime-local class handles allocated by BunEmbed.cpp.
     class_registry: std.ArrayListUnmanaged(*BunClass) = .{},
 
-    fn captureException(runtime: *BunRuntime, global: *JSGlobalObject, value: JSValue) BunEvalResult {
-        // Try to get a string representation via toString()
-        const slice = value.toSlice(global, bun.default_allocator) catch {
+    fn setLastErrorBytes(runtime: *BunRuntime, bytes: []const u8) BunEvalResult {
+        const err_str = bun.default_allocator.allocSentinel(u8, bytes.len, 0) catch {
             return .{ .success = 0, .@"error" = "exception (failed to capture message)" };
         };
-        defer slice.deinit();
-
-        const data = slice.ptr[0..slice.len];
-
-        // Null-terminate and store
-        const err_str = bun.default_allocator.allocSentinel(u8, data.len, 0) catch {
-            return .{ .success = 0, .@"error" = "exception (failed to capture message)" };
-        };
-        @memcpy(err_str[0..data.len], data);
+        if (bytes.len > 0) {
+            @memcpy(err_str[0..bytes.len], bytes);
+        }
 
         runtime.freeLastError();
         runtime.last_error_buf = err_str;
-
         return .{ .success = 0, .@"error" = err_str };
+    }
+
+    fn captureException(runtime: *BunRuntime, global: *JSGlobalObject, value: JSValue) BunEvalResult {
+        const thrown_value = if (value.asException(global.vm())) |exception|
+            exception.value()
+        else
+            value;
+
+        var array = std.Io.Writer.Allocating.init(bun.default_allocator);
+        defer array.deinit();
+
+        jsc.ConsoleObject.format2(.Error, global, @ptrCast(&thrown_value), 1, &array.writer, .{
+            .enable_colors = false,
+            .add_newline = false,
+            .flush = false,
+            .quote_strings = true,
+            .ordered_properties = false,
+            .max_depth = 4,
+        }) catch {
+            global.clearException();
+            return runtime.setLastErrorBytes("error: [failed to format error]");
+        };
+
+        if (global.hasException()) {
+            global.clearException();
+            return runtime.setLastErrorBytes("error: [failed to format error]");
+        }
+
+        array.writer.flush() catch {
+            return runtime.setLastErrorBytes("exception (failed to capture message)");
+        };
+
+        return runtime.setLastErrorBytes(array.written());
     }
 
     fn freeLastError(runtime: *BunRuntime) void {
@@ -333,6 +362,11 @@ extern fn BunEmbed__disposeClassInstance(
 ) bool;
 
 extern fn BunEmbed__classPrototype(
+    global: *JSGlobalObject,
+    class_handle: *BunClass,
+) JSValue;
+
+extern fn BunEmbed__classConstructor(
     global: *JSGlobalObject,
     class_handle: *BunClass,
 ) JSValue;
@@ -1047,6 +1081,13 @@ pub export fn bun_class_prototype(ctx: ?*BunContext, class_handle: ?*BunClass) c
     return if (result == .zero) toBunValue(.js_undefined) else toBunValue(result);
 }
 
+pub export fn bun_class_constructor(ctx: ?*BunContext, class_handle: ?*BunClass) callconv(.c) BunValue {
+    const global = toGlobal(ctx) orelse return toBunValue(.js_undefined);
+    const klass = class_handle orelse return toBunValue(.js_undefined);
+    const result = BunEmbed__classConstructor(global, klass);
+    return if (result == .zero) toBunValue(.js_undefined) else toBunValue(result);
+}
+
 // ---------------------------------------------------------------------------
 // Value Introspection & Conversion
 // ---------------------------------------------------------------------------
@@ -1316,18 +1357,29 @@ pub export fn bun_call(
     else
         return 0;
 
-    const result = function.call(global, toJSValue(this_value), args) catch {
+    const result = function.call(global, toJSValue(this_value), args) catch |err| {
         // Capture the exception message into last_error_buf so the caller
         // can retrieve it with bun_last_error().
         if (runtime) |rt| {
-            if (global.tryTakeException()) |exc| {
-                _ = rt.captureException(global, exc);
-            }
+            _ = rt.captureException(global, global.takeException(err));
         } else {
             global.clearException();
         }
         return 0; // BUN_EXCEPTION sentinel
     };
+
+    if (global.tryTakeException()) |exc| {
+        if (runtime) |rt| {
+            _ = rt.captureException(global, exc);
+        } else {
+            global.clearException();
+        }
+        return 0;
+    }
+
+    if (result == .zero)
+        return 0;
+
     return toBunValue(result);
 }
 
@@ -1410,6 +1462,7 @@ comptime {
     _ = &bun_instanceof_class;
     _ = &bun_class_dispose;
     _ = &bun_class_prototype;
+    _ = &bun_class_constructor;
     _ = &bun_is_undefined;
     _ = &bun_is_null;
     _ = &bun_is_bool;

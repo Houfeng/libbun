@@ -25,6 +25,23 @@ typedef struct {
     char text[64];
 } NativeText;
 
+static void text_assign_utf8(NativeText* text, const char* utf8, size_t len)
+{
+    if (!text || !utf8) return;
+    if (len >= sizeof(text->text)) len = sizeof(text->text) - 1;
+    memcpy(text->text, utf8, len);
+    text->text[len] = '\0';
+}
+
+static void text_assign_value(BunContext* ctx, NativeText* text, BunValue value)
+{
+    size_t len = 0;
+    char* utf8 = bun_to_utf8(ctx, value, &len);
+    if (!utf8) return;
+    text_assign_utf8(text, utf8, len);
+    free(utf8);
+}
+
 static BunValue view_get_x(BunContext* ctx, BunValue this_value, void* native_ptr, void* userdata)
 {
     (void)ctx;
@@ -95,14 +112,7 @@ static void text_set_content(BunContext* ctx, BunValue this_value, void* native_
     NativeText* text = (NativeText*)native_ptr;
     if (!text) return;
 
-    size_t len = 0;
-    char* utf8 = bun_to_utf8(ctx, value, &len);
-    if (!utf8) return;
-
-    if (len >= sizeof(text->text)) len = sizeof(text->text) - 1;
-    memcpy(text->text, utf8, len);
-    text->text[len] = '\0';
-    free(utf8);
+    text_assign_value(ctx, text, value);
 }
 
 static BunValue text_measure(BunContext* ctx, BunValue this_value, void* native_ptr, int argc, const BunValue* argv, void* userdata)
@@ -123,6 +133,31 @@ static void native_view_finalize(void* native_ptr, void* userdata)
     free(native_ptr);
 }
 
+static BunValue view_construct(BunContext* ctx, BunClass* klass, int argc, const BunValue* argv, void* userdata)
+{
+    (void)userdata;
+    NativeView* view = (NativeView*)calloc(1, sizeof(*view));
+    if (!view) return BUN_UNDEFINED;
+
+    if (argc >= 1 && argv) view->x = bun_to_int32(argv[0]);
+    if (argc >= 2 && argv) view->y = bun_to_int32(argv[1]);
+
+    return bun_class_new(ctx, klass, view, native_view_finalize, "View");
+}
+
+static BunValue text_construct(BunContext* ctx, BunClass* klass, int argc, const BunValue* argv, void* userdata)
+{
+    (void)userdata;
+    NativeText* text = (NativeText*)calloc(1, sizeof(*text));
+    if (!text) return BUN_UNDEFINED;
+
+    if (argc >= 1 && argv) text->view.x = bun_to_int32(argv[0]);
+    if (argc >= 2 && argv) text->view.y = bun_to_int32(argv[1]);
+    if (argc >= 3 && argv) text_assign_value(ctx, text, argv[2]);
+
+    return bun_class_new(ctx, klass, text, native_view_finalize, "Text");
+}
+
 static const BunClassPropertyDescriptor VIEW_PROPERTIES[] = {
     { "x", 1, view_get_x, view_set_x, NULL, 0, 0, 0 },
     { "y", 1, view_get_y, view_set_y, NULL, 0, 0, 0 },
@@ -139,6 +174,9 @@ static const BunClassDescriptor VIEW_CLASS = {
     sizeof(VIEW_PROPERTIES) / sizeof(VIEW_PROPERTIES[0]),
     VIEW_METHODS,
     sizeof(VIEW_METHODS) / sizeof(VIEW_METHODS[0]),
+    view_construct,
+    NULL,
+    2,
 };
 
 static const BunClassPropertyDescriptor TEXT_PROPERTIES[] = {
@@ -156,6 +194,9 @@ static const BunClassDescriptor TEXT_CLASS = {
     sizeof(TEXT_PROPERTIES) / sizeof(TEXT_PROPERTIES[0]),
     TEXT_METHODS,
     sizeof(TEXT_METHODS) / sizeof(TEXT_METHODS[0]),
+    text_construct,
+    NULL,
+    3,
 };
 
 static void counter_finalize(void* userdata)
@@ -224,6 +265,19 @@ static BunValue native_greet(BunContext* ctx, int argc, const BunValue* argv, vo
     return bun_string(ctx, buf, strlen(buf));
 }
 
+static BunValue native_async_tick(BunContext* ctx, int argc, const BunValue* argv, void* userdata)
+{
+    (void)ctx;
+    (void)argc;
+    (void)argv;
+    int* tick_count = (int*)userdata;
+    if (!tick_count) return BUN_UNDEFINED;
+
+    *tick_count += 1;
+    printf("Async tick %d\n", *tick_count);
+    return BUN_UNDEFINED;
+}
+
 static void float_buffer_finalize(void* userdata)
 {
     float* buf = (float*)userdata;
@@ -243,6 +297,9 @@ static BunValue native_sum_typed(BunContext* ctx, int argc, const BunValue* argv
 
 int main(void)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     printf("Initializing Bun runtime...\n");
 
     BunRuntime* rt = bun_initialize(NULL);
@@ -253,12 +310,15 @@ int main(void)
 
     BunContext* ctx = bun_context(rt);
     BunValue global = bun_global(ctx);
+    int async_tick_count = 0;
 
     BunValue add_fn = bun_function(ctx, "nativeAdd", native_add, NULL, 2);
     BunValue greet_fn = bun_function(ctx, "nativeGreet", native_greet, NULL, 1);
+    BunValue async_tick_fn = bun_function(ctx, "nativeAsyncTick", native_async_tick, &async_tick_count, 0);
 
     bun_set(ctx, global, "nativeAdd", 9, add_fn);
     bun_set(ctx, global, "nativeGreet", 11, greet_fn);
+    bun_set(ctx, global, "nativeAsyncTick", 15, async_tick_fn);
 
     Counter* counter = malloc(sizeof(*counter));
     if (!counter) {
@@ -297,9 +357,13 @@ int main(void)
     BunValue label_obj = bun_class_new(ctx, text_class, label, native_view_finalize, "Text");
     BunValue view_proto = bun_class_prototype(ctx, view_class);
     BunValue text_proto = bun_class_prototype(ctx, text_class);
+    BunValue view_ctor = bun_class_constructor(ctx, view_class);
+    BunValue text_ctor = bun_class_constructor(ctx, text_class);
     bun_set(ctx, global, "label", 5, label_obj);
     bun_set(ctx, global, "ViewProto", 9, view_proto);
     bun_set(ctx, global, "TextProto", 9, text_proto);
+    bun_set(ctx, global, "View", 4, view_ctor);
+    bun_set(ctx, global, "Text", 4, text_ctor);
 
     printf("class instance? %d\n", bun_is_class_instance(ctx, label_obj));
     printf("instanceof View? %d\n", bun_instanceof_class(ctx, label_obj, view_class));
@@ -316,6 +380,15 @@ int main(void)
     if (!r.success) fprintf(stderr, "Error: %s\n", r.error);
 
     r = bun_eval_string(ctx, "console.log('nativeAdd(3, 4) =', nativeAdd(3, 4))");
+    if (!r.success) fprintf(stderr, "Error: %s\n", r.error);
+
+    r = bun_eval_string(ctx,
+        "const fromCtor = new Text(5, 9, 'from constructor');"
+        "console.log('fromCtor instanceof Text?', fromCtor instanceof Text);"
+        "console.log('fromCtor instanceof View?', fromCtor instanceof View);"
+        "console.log('fromCtor.measure() =', fromCtor.measure());"
+        "console.log('fromCtor.moveBy(1, 2) =', fromCtor.moveBy(1, 2));"
+        "console.log('fromCtor.constructor === Text?', fromCtor.constructor === Text);");
     if (!r.success) fprintf(stderr, "Error: %s\n", r.error);
 
     r = bun_eval_string(ctx, "console.log(nativeGreet('Bun'))");
@@ -348,15 +421,10 @@ int main(void)
         }
     }
 
-    // Schedule a timer to demonstrate event loop integration
-    r = bun_eval_string(ctx,
-        "let count = 0;"
-        "const timer = setInterval(() => {"
-        "  count++;"
-        "  console.log('Timer tick', count);"
-        "  if (count >= 3) clearInterval(timer);"
-        "}, 100);");
-    if (!r.success) fprintf(stderr, "Error: %s\n", r.error);
+    // Queue host-driven async calls to demonstrate event loop integration.
+    bun_call_async(ctx, async_tick_fn, BUN_UNDEFINED, 0, NULL);
+    bun_call_async(ctx, async_tick_fn, BUN_UNDEFINED, 0, NULL);
+    bun_call_async(ctx, async_tick_fn, BUN_UNDEFINED, 0, NULL);
 
     // ------------------------------------------------------------------
     // Demonstrate bun_array_buffer and bun_typed_array (zero-copy)

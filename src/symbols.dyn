@@ -580,6 +580,7 @@
     _bun_instanceof_class;
     _bun_class_dispose;
     _bun_class_prototype;
+    _bun_class_constructor;
     _bun_is_undefined;
     _bun_is_null;
     _bun_is_bool;
