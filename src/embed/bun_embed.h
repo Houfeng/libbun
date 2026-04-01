@@ -204,10 +204,6 @@ BunContext* bun_context(BunRuntime* rt);
 
 /// Evaluate JavaScript/TypeScript source with script semantics.
 ///
-/// Use bun_eval_expr() when you specifically want expression semantics
-/// (for example object literals like `{ x: 1 }`), because script parsing
-/// treats top-level `{}` as a statement block.
-///
 /// @param ctx   JS context.
 /// @param code  UTF-8 source code, null-terminated.
 /// @return      The JS completion value on success, or BUN_EXCEPTION (0) if an
@@ -215,17 +211,6 @@ BunContext* bun_context(BunRuntime* rt);
 ///              message after a BUN_EXCEPTION return. The error string is valid
 ///              until the next bun_eval*()/bun_call() call on this context.
 BunValue bun_eval_string(BunContext* ctx, const char* code);
-
-/// Evaluate JavaScript as a strict expression.
-///
-/// The input is wrapped as `(<expr>)` before evaluation so object literals are
-/// interpreted as expressions without relying on heuristics.
-///
-/// @param ctx   JS context.
-/// @param expr  UTF-8 source code containing an expression, null-terminated.
-/// @return      The expression value on success, or BUN_EXCEPTION (0) on
-///              failure. Error text is available via bun_last_error(ctx).
-BunValue bun_eval_expr(BunContext* ctx, const char* expr);
 
 /// Load and evaluate a JavaScript/TypeScript file as an ES module.
 ///

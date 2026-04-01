@@ -569,26 +569,6 @@ pub export fn bun_eval_string(ctx: ?*BunContext, code_ptr: ?[*:0]const u8) callc
     return eval_ctx.result;
 }
 
-pub export fn bun_eval_expr(ctx: ?*BunContext, expr_ptr: ?[*:0]const u8) callconv(.c) BunValue {
-    const global = toGlobal(ctx) orelse return 0;
-    const runtime = vmToRuntime(global.bunVM()) orelse return 0;
-    runtime.freeLastError();
-
-    const expr = if (expr_ptr) |p| std.mem.span(p) else {
-        runtime.setLastErrorBytes("null expression");
-        return 0;
-    };
-
-    var eval_ctx = EvalExprContext{
-        .runtime = runtime,
-        .global = global,
-        .expr = expr,
-        .result = 0,
-    };
-    runtime.vm.runWithAPILock(EvalExprContext, &eval_ctx, EvalExprContext.run);
-    return eval_ctx.result;
-}
-
 const EvalContext = struct {
     runtime: *BunRuntime,
     global: *JSGlobalObject,
@@ -637,66 +617,6 @@ const EvalContext = struct {
             this.runtime.captureException(this.global, exc);
         } else if (final_result == .zero) {
             this.runtime.setLastErrorBytes("evaluation returned null");
-        } else {
-            this.result = toBunValue(final_result);
-        }
-    }
-};
-
-const EvalExprContext = struct {
-    runtime: *BunRuntime,
-    global: *JSGlobalObject,
-    expr: []const u8,
-    result: BunValue,
-
-    pub fn run(this: *EvalExprContext) void {
-        const source = std.fmt.allocPrint(this.global.allocator(), "({s})", .{this.expr}) catch {
-            this.runtime.setLastErrorBytes("failed to allocate expression wrapper");
-            return;
-        };
-        defer this.global.allocator().free(source);
-
-        var exception: JSValue = .js_undefined;
-        const ret = Bun__REPL__evaluate(
-            this.global,
-            source.ptr,
-            source.len,
-            "embed:expr",
-            "embed:expr".len,
-            &exception,
-        );
-
-        var final_result = ret;
-
-        if (exception != .js_undefined and exception != .zero) {
-            this.runtime.captureException(this.global, exception);
-            return;
-        }
-
-        if (ret.asAnyPromise()) |promise| {
-            promise.setHandled(this.global.vm());
-            this.runtime.vm.waitForPromise(promise);
-
-            switch (promise.status()) {
-                .fulfilled => {
-                    final_result = promise.result(this.global.vm());
-                },
-                .rejected => {
-                    const rejection = promise.result(this.global.vm());
-                    this.runtime.captureException(this.global, rejection);
-                    return;
-                },
-                .pending => {
-                    this.runtime.setLastErrorBytes("expression promise did not settle");
-                    return;
-                },
-            }
-        }
-
-        if (this.global.tryTakeException()) |exc| {
-            this.runtime.captureException(this.global, exc);
-        } else if (final_result == .zero) {
-            this.runtime.setLastErrorBytes("expression evaluation returned null");
         } else {
             this.result = toBunValue(final_result);
         }
@@ -1479,7 +1399,6 @@ comptime {
     _ = &bun_destroy;
     _ = &bun_context;
     _ = &bun_eval_string;
-    _ = &bun_eval_expr;
     _ = &bun_eval_file;
     _ = &bun_run_pending_jobs;
     _ = &bun_get_event_fd;

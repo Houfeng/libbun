@@ -556,7 +556,6 @@
     _bun_initialize;
     _bun_destroy;
     _bun_eval_string;
-    _bun_eval_expr;
     _bun_eval_file;
     _bun_run_pending_jobs;
     _bun_get_event_fd;
