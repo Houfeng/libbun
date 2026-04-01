@@ -149,10 +149,51 @@ const BunRuntime = struct {
     }
 
     fn captureException(runtime: *BunRuntime, global: *JSGlobalObject, value: JSValue) void {
-        const thrown_value = if (value.asException(global.vm())) |exception|
+        var thrown_value = if (value.asException(global.vm())) |exception|
             exception.value()
         else
             value;
+
+        if (!thrown_value.isAnyError()) {
+            if (thrown_value.toError()) |error_like| {
+                thrown_value = error_like;
+            }
+        }
+
+        if (!thrown_value.isAnyError() and thrown_value.isObject()) {
+            const maybe_name_value = (thrown_value.getOwn(global, "name") catch null) orelse
+                (thrown_value.getPropertyValue(global, "name") catch null);
+            const maybe_message_value = (thrown_value.getOwn(global, "message") catch null) orelse
+                (thrown_value.getPropertyValue(global, "message") catch null);
+
+            if (maybe_message_value) |message_value| {
+                if (message_value.isString()) {
+                    const message_bytes = message_value.toUTF8Bytes(global, bun.default_allocator) catch null;
+                    if (message_bytes) |message| {
+                        defer bun.default_allocator.free(message);
+
+                        if (maybe_name_value) |name_value| {
+                            if (name_value.isString()) {
+                                const name_bytes = name_value.toUTF8Bytes(global, bun.default_allocator) catch null;
+                                if (name_bytes) |name| {
+                                    defer bun.default_allocator.free(name);
+
+                                    const combined = std.fmt.allocPrint(bun.default_allocator, "{s}: {s}", .{ name, message }) catch null;
+                                    if (combined) |text| {
+                                        defer bun.default_allocator.free(text);
+                                        runtime.setLastErrorBytes(text);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+
+                        runtime.setLastErrorBytes(message);
+                        return;
+                    }
+                }
+            }
+        }
 
         // Non-Error thrown values are reported with side-effect-free, type-based
         // messages. This avoids invoking coercion hooks like Symbol.toPrimitive

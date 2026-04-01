@@ -460,6 +460,41 @@ int main(void)
         }
     }
 
+    {
+        BunValue obj_result = bun_eval_string(ctx, "({ answer: 42 })");
+        if (obj_result == BUN_EXCEPTION) {
+            fprintf(stderr, "[FAIL] bun_eval_string('({ answer: 42 })') threw: %s\n", bun_last_error(ctx));
+        } else if (!bun_is_object(obj_result)) {
+            fprintf(stderr, "[FAIL] bun_eval_string('({ answer: 42 })') did not return an object\n");
+        } else {
+            BunValue answer = bun_get(ctx, obj_result, "answer", 6);
+            if (!bun_is_number(answer)) {
+                fprintf(stderr, "[FAIL] object literal answer property is not a number\n");
+            } else {
+                double number = bun_to_number(ctx, answer);
+                if (number == 42.0) {
+                    printf("[PASS] bun_eval_string('({ answer: 42 })') -> object.answer = 42\n");
+                } else {
+                    fprintf(stderr, "[FAIL] object literal answer = %g (expected 42)\n", number);
+                }
+            }
+        }
+    }
+
+    {
+        BunValue syntax_result = bun_eval_string(ctx, "const x =");
+        if (syntax_result != BUN_EXCEPTION) {
+            fprintf(stderr, "[FAIL] bun_eval_string('const x =') unexpectedly succeeded\n");
+        } else {
+            const char* err = bun_last_error(ctx);
+            if (err && strstr(err, "SyntaxError") != NULL) {
+                printf("[PASS] bun_eval_string(syntax error) -> BUN_EXCEPTION\n");
+            } else {
+                fprintf(stderr, "[FAIL] bun_eval_string(syntax error) returned unexpected message: %s\n", err ? err : "(null)");
+            }
+        }
+    }
+
 #define EVAL(code)                                               \
     do {                                                         \
         if (bun_eval_string(ctx, (code)) == BUN_EXCEPTION)       \
@@ -573,6 +608,117 @@ int main(void)
                                 } else {
                                     fprintf(stderr, "[FAIL] __embed_eval_file_ok = %g (expected 42)\n", n);
                                 }
+                            }
+                        }
+                    }
+
+                    unlink(tmp_path);
+                }
+
+                bun_destroy(eval_file_rt);
+            }
+        }
+
+        {
+            BunRuntime* eval_file_rt = bun_initialize(NULL);
+            BunContext* eval_file_ctx = bun_context(eval_file_rt);
+            if (!eval_file_rt || !eval_file_ctx) {
+                fprintf(stderr, "[FAIL] unable to initialize runtime for eval_file top-level await case\n");
+            } else {
+                char tmp_path[128];
+                snprintf(tmp_path, sizeof(tmp_path), "/tmp/bun-embed-await-%ld.mjs", (long)getpid());
+                int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (fd < 0) {
+                    fprintf(stderr, "[FAIL] creating eval_file top-level await module failed\n");
+                } else {
+                    const char* module_src = "globalThis.__embed_eval_file_await = await Promise.resolve(40 + 2);\n";
+                    ssize_t wrote = write(fd, module_src, strlen(module_src));
+                    close(fd);
+
+                    if (wrote < 0 || (size_t)wrote != strlen(module_src)) {
+                        fprintf(stderr, "[FAIL] writing eval_file top-level await module failed\n");
+                    } else {
+                        BunValue eval_file_await = bun_eval_file(eval_file_ctx, tmp_path);
+                        if (eval_file_await == BUN_EXCEPTION) {
+                            fprintf(stderr, "[FAIL] bun_eval_file(top-level await) threw: %s\n", bun_last_error(eval_file_ctx));
+                        } else if (eval_file_await != BUN_UNDEFINED) {
+                            fprintf(stderr, "[FAIL] bun_eval_file(top-level await) returned %llu (expected BUN_UNDEFINED)\n", (unsigned long long)eval_file_await);
+                        } else {
+                            BunValue awaited = bun_eval_string(eval_file_ctx, "globalThis.__embed_eval_file_await");
+                            if (awaited == BUN_EXCEPTION) {
+                                fprintf(stderr, "[FAIL] reading __embed_eval_file_await threw: %s\n", bun_last_error(eval_file_ctx));
+                            } else {
+                                double n = bun_to_number(eval_file_ctx, awaited);
+                                if (n == 42.0) {
+                                    printf("[PASS] bun_eval_file(top-level await) -> BUN_UNDEFINED and module executed\n");
+                                } else {
+                                    fprintf(stderr, "[FAIL] __embed_eval_file_await = %g (expected 42)\n", n);
+                                }
+                            }
+                        }
+                    }
+
+                    unlink(tmp_path);
+                }
+
+                bun_destroy(eval_file_rt);
+            }
+        }
+
+        {
+            BunRuntime* eval_file_rt = bun_initialize(NULL);
+            BunContext* eval_file_ctx = bun_context(eval_file_rt);
+            if (!eval_file_rt || !eval_file_ctx) {
+                fprintf(stderr, "[FAIL] unable to initialize runtime for eval_file missing-file case\n");
+            } else {
+                char tmp_path[128];
+                snprintf(tmp_path, sizeof(tmp_path), "/tmp/bun-embed-missing-%ld.mjs", (long)getpid());
+                unlink(tmp_path);
+
+                BunValue missing = bun_eval_file(eval_file_ctx, tmp_path);
+                if (missing != BUN_EXCEPTION) {
+                    fprintf(stderr, "[FAIL] bun_eval_file(missing file) unexpectedly succeeded\n");
+                } else {
+                    const char* err = bun_last_error(eval_file_ctx);
+                    if (err && err[0] != '\0') {
+                        printf("[PASS] bun_eval_file(missing file) -> BUN_EXCEPTION\n");
+                    } else {
+                        fprintf(stderr, "[FAIL] bun_eval_file(missing file) did not provide an error message\n");
+                    }
+                }
+
+                bun_destroy(eval_file_rt);
+            }
+        }
+
+        {
+            BunRuntime* eval_file_rt = bun_initialize(NULL);
+            BunContext* eval_file_ctx = bun_context(eval_file_rt);
+            if (!eval_file_rt || !eval_file_ctx) {
+                fprintf(stderr, "[FAIL] unable to initialize runtime for eval_file syntax-error case\n");
+            } else {
+                char tmp_path[128];
+                snprintf(tmp_path, sizeof(tmp_path), "/tmp/bun-embed-syntax-%ld.mjs", (long)getpid());
+                int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (fd < 0) {
+                    fprintf(stderr, "[FAIL] creating eval_file syntax-error module failed\n");
+                } else {
+                    const char* module_src = "const broken = ;\n";
+                    ssize_t wrote = write(fd, module_src, strlen(module_src));
+                    close(fd);
+
+                    if (wrote < 0 || (size_t)wrote != strlen(module_src)) {
+                        fprintf(stderr, "[FAIL] writing eval_file syntax-error module failed\n");
+                    } else {
+                        BunValue eval_file_syntax = bun_eval_file(eval_file_ctx, tmp_path);
+                        if (eval_file_syntax != BUN_EXCEPTION) {
+                            fprintf(stderr, "[FAIL] bun_eval_file(syntax error) unexpectedly succeeded\n");
+                        } else {
+                            const char* err = bun_last_error(eval_file_ctx);
+                            if (err && (strstr(err, "SyntaxError") != NULL || strstr(err, "Unexpected") != NULL || strstr(err, "BuildMessage") != NULL)) {
+                                printf("[PASS] bun_eval_file(syntax error) -> readable error text\n");
+                            } else {
+                                fprintf(stderr, "[FAIL] bun_eval_file(syntax error) returned unexpected message: %s\n", err ? err : "(null)");
                             }
                         }
                     }
