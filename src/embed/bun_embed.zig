@@ -4,10 +4,6 @@ const std = @import("std");
 const bun = @import("bun");
 const jsc = bun.jsc;
 const js_ast = bun.ast;
-const js_parser = bun.js_parser;
-const js_printer = bun.js_printer;
-const logger = bun.logger;
-const strings = bun.strings;
 const Arena = bun.allocators.MimallocArena;
 const VirtualMachine = jsc.VirtualMachine;
 const JSGlobalObject = jsc.JSGlobalObject;
@@ -573,6 +569,26 @@ pub export fn bun_eval_string(ctx: ?*BunContext, code_ptr: ?[*:0]const u8) callc
     return eval_ctx.result;
 }
 
+pub export fn bun_eval_expr(ctx: ?*BunContext, expr_ptr: ?[*:0]const u8) callconv(.c) BunValue {
+    const global = toGlobal(ctx) orelse return 0;
+    const runtime = vmToRuntime(global.bunVM()) orelse return 0;
+    runtime.freeLastError();
+
+    const expr = if (expr_ptr) |p| std.mem.span(p) else {
+        runtime.setLastErrorBytes("null expression");
+        return 0;
+    };
+
+    var eval_ctx = EvalExprContext{
+        .runtime = runtime,
+        .global = global,
+        .expr = expr,
+        .result = 0,
+    };
+    runtime.vm.runWithAPILock(EvalExprContext, &eval_ctx, EvalExprContext.run);
+    return eval_ctx.result;
+}
+
 const EvalContext = struct {
     runtime: *BunRuntime,
     global: *JSGlobalObject,
@@ -580,16 +596,11 @@ const EvalContext = struct {
     result: BunValue,
 
     pub fn run(this: *EvalContext) void {
-        const transformed = transformForEmbedEval(this.global, this.code);
-        defer if (transformed) |code| this.global.allocator().free(code);
-
-        const source = transformed orelse this.code;
-
         var exception: JSValue = .js_undefined;
         const ret = Bun__REPL__evaluate(
             this.global,
-            source.ptr,
-            source.len,
+            this.code.ptr,
+            this.code.len,
             "embed:eval",
             "embed:eval".len,
             &exception,
@@ -632,102 +643,65 @@ const EvalContext = struct {
     }
 };
 
-fn transformForEmbedEval(global: *JSGlobalObject, code: []const u8) ?[]u8 {
-    const vm = global.bunVM();
+const EvalExprContext = struct {
+    runtime: *BunRuntime,
+    global: *JSGlobalObject,
+    expr: []const u8,
+    result: BunValue,
 
-    if (code.len == 0 or strings.trim(code, " \t\n\r").len == 0) {
-        return null;
+    pub fn run(this: *EvalExprContext) void {
+        const source = std.fmt.allocPrint(this.global.allocator(), "({s})", .{this.expr}) catch {
+            this.runtime.setLastErrorBytes("failed to allocate expression wrapper");
+            return;
+        };
+        defer this.global.allocator().free(source);
+
+        var exception: JSValue = .js_undefined;
+        const ret = Bun__REPL__evaluate(
+            this.global,
+            source.ptr,
+            source.len,
+            "embed:expr",
+            "embed:expr".len,
+            &exception,
+        );
+
+        var final_result = ret;
+
+        if (exception != .js_undefined and exception != .zero) {
+            this.runtime.captureException(this.global, exception);
+            return;
+        }
+
+        if (ret.asAnyPromise()) |promise| {
+            promise.setHandled(this.global.vm());
+            this.runtime.vm.waitForPromise(promise);
+
+            switch (promise.status()) {
+                .fulfilled => {
+                    final_result = promise.result(this.global.vm());
+                },
+                .rejected => {
+                    const rejection = promise.result(this.global.vm());
+                    this.runtime.captureException(this.global, rejection);
+                    return;
+                },
+                .pending => {
+                    this.runtime.setLastErrorBytes("expression promise did not settle");
+                    return;
+                },
+            }
+        }
+
+        if (this.global.tryTakeException()) |exc| {
+            this.runtime.captureException(this.global, exc);
+        } else if (final_result == .zero) {
+            this.runtime.setLastErrorBytes("expression evaluation returned null");
+        } else {
+            this.result = toBunValue(final_result);
+        }
     }
-
-    const is_object_literal = isLikelyEmbedObjectLiteral(code);
-    if (!is_object_literal) {
-        // Keep normal expressions/statements untouched so bun_eval_string()
-        // returns the actual completion value (for example 1+1 => 2).
-        return null;
-    }
-
-    const processed_code = if (is_object_literal)
-        std.fmt.allocPrint(global.allocator(), "({s})", .{code}) catch return null
-    else
-        code;
-    defer if (is_object_literal) global.allocator().free(processed_code);
-
-    var arena = Arena.init();
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var opts = js_parser.Parser.Options.init(vm.transpiler.options.jsx, .tsx);
-    opts.repl_mode = true;
-    opts.features.dead_code_elimination = false;
-    opts.features.top_level_await = true;
-
-    if (vm.transpiler.macro_context == null) {
-        vm.transpiler.macro_context = bun.ast.Macro.MacroContext.init(&vm.transpiler);
-    }
-    opts.macro_context = &vm.transpiler.macro_context.?;
-
-    var log = logger.Log.init(arena.backingAllocator());
-    defer log.deinit();
-
-    const source = logger.Source.initPathString("[embed]", processed_code);
-
-    var parser = js_parser.Parser.init(
-        opts,
-        &log,
-        &source,
-        vm.transpiler.options.define,
-        allocator,
-    ) catch return null;
-
-    const parse_result = parser.parse() catch return null;
-    if (parse_result != .ast) return null;
-
-    const ast = parse_result.ast;
-    if (log.errors > 0) return null;
-
-    const buffer_writer = js_printer.BufferWriter.init(global.allocator());
-    var buffer_printer = js_printer.BufferPrinter.init(buffer_writer);
-    defer buffer_printer.ctx.buffer.deinit();
-
-    const symbols_nested = js_ast.Symbol.NestedList.fromBorrowedSliceDangerous(&.{ast.symbols});
-    const symbols_map = js_ast.Symbol.Map.initList(symbols_nested);
-
-    _ = js_printer.printAst(
-        @TypeOf(&buffer_printer),
-        &buffer_printer,
-        ast,
-        symbols_map,
-        &source,
-        true,
-        .{ .mangled_props = null },
-        false,
-    ) catch return null;
-
-    const written = buffer_printer.ctx.getWritten();
-    return global.allocator().dupe(u8, written) catch null;
-}
-
-fn isLikelyEmbedObjectLiteral(code: []const u8) bool {
-    var start: usize = 0;
-    while (start < code.len and (code[start] == ' ' or code[start] == '\t' or code[start] == '\n' or code[start] == '\r')) {
-        start += 1;
-    }
-
-    if (start >= code.len or code[start] != '{') {
-        return false;
-    }
-
-    var end: usize = code.len;
-    while (end > 0 and (code[end - 1] == ' ' or code[end - 1] == '\t' or code[end - 1] == '\n' or code[end - 1] == '\r')) {
-        end -= 1;
-    }
-
-    if (end > 0 and code[end - 1] == ';') {
-        return false;
-    }
-
-    return true;
-}
+};
 
 pub export fn bun_eval_file(ctx: ?*BunContext, path_ptr: ?[*:0]const u8) callconv(.c) BunValue {
     const global = toGlobal(ctx) orelse return 0;
@@ -1505,6 +1479,7 @@ comptime {
     _ = &bun_destroy;
     _ = &bun_context;
     _ = &bun_eval_string;
+    _ = &bun_eval_expr;
     _ = &bun_eval_file;
     _ = &bun_run_pending_jobs;
     _ = &bun_get_event_fd;

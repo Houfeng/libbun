@@ -431,30 +431,30 @@ int main(void)
 
     printf("\n--- embed eval return-value regression ---\n");
     {
-        BunValue add_result = bun_eval_string(ctx, "1+1");
+        BunValue add_result = bun_eval_expr(ctx, "1+1");
         if (add_result == BUN_EXCEPTION) {
-            fprintf(stderr, "[FAIL] bun_eval_string('1+1') threw: %s\n", bun_last_error(ctx));
+            fprintf(stderr, "[FAIL] bun_eval_expr('1+1') threw: %s\n", bun_last_error(ctx));
         } else {
             double number = bun_to_number(ctx, add_result);
             if (number == 2.0) {
-                printf("[PASS] bun_eval_string('1+1') -> 2\n");
+                printf("[PASS] bun_eval_expr('1+1') -> 2\n");
             } else {
-                fprintf(stderr, "[FAIL] bun_eval_string('1+1') -> %g (expected 2)\n", number);
+                fprintf(stderr, "[FAIL] bun_eval_expr('1+1') -> %g (expected 2)\n", number);
             }
         }
     }
 
     {
-        BunValue str_result = bun_eval_string(ctx, "String(1+1)");
+        BunValue str_result = bun_eval_expr(ctx, "String(1+1)");
         if (str_result == BUN_EXCEPTION) {
-            fprintf(stderr, "[FAIL] bun_eval_string('String(1+1)') threw: %s\n", bun_last_error(ctx));
+            fprintf(stderr, "[FAIL] bun_eval_expr('String(1+1)') threw: %s\n", bun_last_error(ctx));
         } else {
             size_t str_len = 0;
             char* str = bun_to_utf8(ctx, str_result, &str_len);
             if (str && str_len == 1 && strcmp(str, "2") == 0) {
-                printf("[PASS] bun_eval_string('String(1+1)') -> \"2\"\n");
+                printf("[PASS] bun_eval_expr('String(1+1)') -> \"2\"\n");
             } else {
-                fprintf(stderr, "[FAIL] bun_eval_string('String(1+1)') -> %s len=%zu (expected \"2\")\n", str ? str : "(null)", str_len);
+                fprintf(stderr, "[FAIL] bun_eval_expr('String(1+1)') -> %s len=%zu (expected \"2\")\n", str ? str : "(null)", str_len);
             }
             free(str);
         }

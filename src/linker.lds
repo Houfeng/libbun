@@ -326,6 +326,7 @@ BUN_1.2 {
   bun_destroy;
   bun_context;
   bun_eval_string;
+  bun_eval_expr;
   bun_eval_file;
   bun_run_pending_jobs;
   bun_get_event_fd;
