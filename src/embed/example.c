@@ -427,15 +427,17 @@ int main(void)
     printf("unwrap(view)=%p unwrap(text)=%p\n", (void*)unwrapped_view, (void*)unwrapped_text);
 
     printf("\n--- Evaluating JS ---\n");
-    BunEvalResult r;
 
-    r = bun_eval_string(ctx, "console.log('Hello from embedded Bun!')");
-    if (!r.success) fprintf(stderr, "Error: %s\n", r.error);
+#define EVAL(code)                                               \
+    do {                                                         \
+        if (bun_eval_string(ctx, (code)) == BUN_EXCEPTION)       \
+            fprintf(stderr, "Error: %s\n", bun_last_error(ctx)); \
+    } while (0)
 
-    r = bun_eval_string(ctx, "console.log('nativeAdd(3, 4) =', nativeAdd(3, 4))");
-    if (!r.success) fprintf(stderr, "Error: %s\n", r.error);
+    EVAL("console.log('Hello from embedded Bun!')");
+    EVAL("console.log('nativeAdd(3, 4) =', nativeAdd(3, 4))");
 
-    r = bun_eval_string(ctx,
+    EVAL(
         "const fromCtor = new Text(5, 9, 'from constructor');"
         "console.log('fromCtor instanceof Text?', fromCtor instanceof Text);"
         "console.log('fromCtor instanceof View?', fromCtor instanceof View);"
@@ -448,30 +450,25 @@ int main(void)
         "Text.tag = 'updated-static';"
         "console.log('View.tag after Text.tag set =', View.tag);"
         "console.log('Text.tag =', Text.tag);");
-    if (!r.success) fprintf(stderr, "Error: %s\n", r.error);
 
-    r = bun_eval_string(ctx, "console.log(nativeGreet('Bun'))");
-    if (!r.success) fprintf(stderr, "Error: %s\n", r.error);
+    EVAL("console.log(nativeGreet('Bun'))");
 
-    r = bun_eval_string(ctx,
+    EVAL(
         "console.log('counter.value =', counter.value);"
         "counter.value = 42;"
         "console.log('counter.inc() =', counter.inc());"
         "console.log('counter.value =', counter.value);");
-    if (!r.success) fprintf(stderr, "Error: %s\n", r.error);
 
-    r = bun_eval_string(ctx,
+    EVAL(
         "console.log('label.text =', label.text);"
         "console.log('label.measure() =', label.measure());"
         "console.log('moveBy ->', label.moveBy(3, 4));"
         "console.log('label.x,label.y =', label.x, label.y);"
         "console.log('text proto === Object.getPrototypeOf(label):', TextProto === Object.getPrototypeOf(label));"
         "console.log('view proto === Object.getPrototypeOf(TextProto):', ViewProto === Object.getPrototypeOf(TextProto));");
-    if (!r.success) fprintf(stderr, "Error: %s\n", r.error);
 
     // Demonstrate bun_call with error detection.
-    r = bun_eval_string(ctx, "globalThis.throwingFn = () => { throw new Error('boom'); };");
-    if (r.success) {
+    if (bun_eval_string(ctx, "globalThis.throwingFn = () => { throw new Error('boom'); };") != BUN_EXCEPTION) {
         BunValue throwing_fn = bun_get(ctx, global, "throwingFn", 10);
         BunValue result = bun_call(ctx, throwing_fn, BUN_UNDEFINED, 0, NULL);
         if (result == BUN_EXCEPTION) {
@@ -513,12 +510,11 @@ int main(void)
                 host_floats ? host_floats[0] : 0.0f);
         }
 
-        r = bun_eval_string(ctx,
+        EVAL(
             "const a = nativeFloats;"
             "console.log('Float32Array length:', a.length);"
             "let sum = 0; for (const x of a) sum += x;"
             "console.log('Float32Array sum:', sum);");
-        if (!r.success) fprintf(stderr, "Error: %s\n", r.error);
     }
 
     // Wrap a static byte buffer as ArrayBuffer (no finalizer needed).
@@ -534,11 +530,12 @@ int main(void)
             bytes ? (unsigned)bytes[0] : 0);
     }
 
-    r = bun_eval_string(ctx,
+    EVAL(
         "const v = new DataView(nativeBuf);"
         "console.log('ArrayBuffer[0]:', v.getUint8(0).toString(16));"
         "console.log('ArrayBuffer length:', nativeBuf.byteLength);");
-    if (!r.success) fprintf(stderr, "Error: %s\n", r.error);
+
+#undef EVAL
 
     printf("\n--- Running event loop ---\n");
     for (int i = 0; i < 100; i++) {

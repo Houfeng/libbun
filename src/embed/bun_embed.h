@@ -35,15 +35,6 @@ typedef struct BunClass BunClass;
 /// Encoded JavaScript value (NaN-boxed JSValue).
 typedef uint64_t BunValue;
 
-/// Result from evaluating JavaScript code.
-typedef struct {
-    int success; ///< 1 if evaluation succeeded, 0 if failed.
-    /// Error description when success == 0. Points into the runtime's internal
-    /// buffer; valid until the next bun_eval*() or bun_call() call on this
-    /// runtime. Do not free(). NULL when success == 1.
-    const char* error;
-} BunEvalResult;
-
 /// Host function callback callable from JavaScript.
 /// argv points to contiguous BunValue arguments valid only for this call.
 typedef BunValue (*BunHostFn)(BunContext* ctx, int argc, const BunValue* argv, void* userdata);
@@ -212,17 +203,25 @@ BunContext* bun_context(BunRuntime* rt);
 // --------------------------------------------------------------------------
 
 /// Evaluate a JavaScript/TypeScript expression or script.
+///
 /// @param ctx   JS context.
 /// @param code  UTF-8 source code, null-terminated.
-/// @return      Evaluation result. The result and error strings are valid until
-///              the next bun_eval*/bun_run_pending_jobs call on the owning runtime.
-BunEvalResult bun_eval_string(BunContext* ctx, const char* code);
+/// @return      The JS completion value on success, or BUN_EXCEPTION (0) if an
+///              error occurred. Call bun_last_error(ctx) to retrieve the error
+///              message after a BUN_EXCEPTION return. The error string is valid
+///              until the next bun_eval*()/bun_call() call on this context.
+BunValue bun_eval_string(BunContext* ctx, const char* code);
 
 /// Load and evaluate a JavaScript/TypeScript file as an ES module.
+///
+/// ES modules do not produce a meaningful completion value, so BUN_UNDEFINED is
+/// returned on success. On failure BUN_EXCEPTION (0) is returned and the error
+/// message is available via bun_last_error(ctx).
+///
 /// @param ctx   JS context.
 /// @param path  UTF-8 file path, null-terminated. Relative paths resolve from cwd.
-/// @return      Evaluation result.
-BunEvalResult bun_eval_file(BunContext* ctx, const char* path);
+/// @return      BUN_UNDEFINED on success, BUN_EXCEPTION (0) on failure.
+BunValue bun_eval_file(BunContext* ctx, const char* path);
 
 // --------------------------------------------------------------------------
 // Event Loop Integration

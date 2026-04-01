@@ -142,20 +142,17 @@ const BunRuntime = struct {
     /// Runtime-local class handles allocated by BunEmbed.cpp.
     class_registry: std.ArrayListUnmanaged(*BunClass) = .{},
 
-    fn setLastErrorBytes(runtime: *BunRuntime, bytes: []const u8) BunEvalResult {
-        const err_str = bun.default_allocator.allocSentinel(u8, bytes.len, 0) catch {
-            return .{ .success = 0, .@"error" = "exception (failed to capture message)" };
-        };
+    fn setLastErrorBytes(runtime: *BunRuntime, bytes: []const u8) void {
+        const err_str = bun.default_allocator.allocSentinel(u8, bytes.len, 0) catch return;
         if (bytes.len > 0) {
             @memcpy(err_str[0..bytes.len], bytes);
         }
 
         runtime.freeLastError();
         runtime.last_error_buf = err_str;
-        return .{ .success = 0, .@"error" = err_str };
     }
 
-    fn captureException(runtime: *BunRuntime, global: *JSGlobalObject, value: JSValue) BunEvalResult {
+    fn captureException(runtime: *BunRuntime, global: *JSGlobalObject, value: JSValue) void {
         const thrown_value = if (value.asException(global.vm())) |exception|
             exception.value()
         else
@@ -173,19 +170,22 @@ const BunRuntime = struct {
             .max_depth = 4,
         }) catch {
             global.clearException();
-            return runtime.setLastErrorBytes("error: [failed to format error]");
+            runtime.setLastErrorBytes("error: [failed to format error]");
+            return;
         };
 
         if (global.hasException()) {
             global.clearException();
-            return runtime.setLastErrorBytes("error: [failed to format error]");
+            runtime.setLastErrorBytes("error: [failed to format error]");
+            return;
         }
 
         array.writer.flush() catch {
-            return runtime.setLastErrorBytes("exception (failed to capture message)");
+            runtime.setLastErrorBytes("exception (failed to capture message)");
+            return;
         };
 
-        return runtime.setLastErrorBytes(array.written());
+        runtime.setLastErrorBytes(array.written());
     }
 
     fn freeLastError(runtime: *BunRuntime) void {
@@ -223,12 +223,6 @@ const BunRuntime = struct {
         }
         runtime.class_registry.deinit(bun.default_allocator);
     }
-};
-
-/// Result struct matching the C BunEvalResult layout.
-const BunEvalResult = extern struct {
-    success: c_int,
-    @"error": ?[*:0]const u8,
 };
 
 const BunDebuggerMode = enum(c_int) {
@@ -533,18 +527,21 @@ pub export fn bun_context(rt: ?*BunRuntime) callconv(.c) ?*BunContext {
 // Evaluation
 // ---------------------------------------------------------------------------
 
-pub export fn bun_eval_string(ctx: ?*BunContext, code_ptr: ?[*:0]const u8) callconv(.c) BunEvalResult {
-    const global = toGlobal(ctx) orelse return .{ .success = 0, .@"error" = "null context" };
-    const runtime = vmToRuntime(global.bunVM()) orelse return .{ .success = 0, .@"error" = "context has no runtime" };
+pub export fn bun_eval_string(ctx: ?*BunContext, code_ptr: ?[*:0]const u8) callconv(.c) BunValue {
+    const global = toGlobal(ctx) orelse return 0;
+    const runtime = vmToRuntime(global.bunVM()) orelse return 0;
     runtime.freeLastError();
 
-    const code = if (code_ptr) |p| std.mem.span(p) else return .{ .success = 0, .@"error" = "null code" };
+    const code = if (code_ptr) |p| std.mem.span(p) else {
+        runtime.setLastErrorBytes("null code");
+        return 0;
+    };
 
     var eval_ctx = EvalContext{
         .runtime = runtime,
         .global = global,
         .code = code,
-        .result = .{ .success = 0, .@"error" = "eval did not complete" },
+        .result = 0,
     };
     runtime.vm.runWithAPILock(EvalContext, &eval_ctx, EvalContext.run);
     return eval_ctx.result;
@@ -554,7 +551,7 @@ const EvalContext = struct {
     runtime: *BunRuntime,
     global: *JSGlobalObject,
     code: []const u8,
-    result: BunEvalResult,
+    result: BunValue,
 
     pub fn run(this: *EvalContext) void {
         const transformed = transformForEmbedEval(this.global, this.code);
@@ -575,7 +572,7 @@ const EvalContext = struct {
         var final_result = ret;
 
         if (exception != .js_undefined and exception != .zero) {
-            this.result = this.runtime.captureException(this.global, exception);
+            this.runtime.captureException(this.global, exception);
             return;
         }
 
@@ -589,22 +586,22 @@ const EvalContext = struct {
                 },
                 .rejected => {
                     const rejection = promise.result(this.global.vm());
-                    this.result = this.runtime.captureException(this.global, rejection);
+                    this.runtime.captureException(this.global, rejection);
                     return;
                 },
                 .pending => {
-                    this.result = .{ .success = 0, .@"error" = "evaluation promise did not settle" };
+                    this.runtime.setLastErrorBytes("evaluation promise did not settle");
                     return;
                 },
             }
         }
 
         if (this.global.tryTakeException()) |exc| {
-            this.result = this.runtime.captureException(this.global, exc);
+            this.runtime.captureException(this.global, exc);
         } else if (final_result == .zero) {
-            this.result = .{ .success = 0, .@"error" = "evaluation returned null" };
+            this.runtime.setLastErrorBytes("evaluation returned null");
         } else {
-            this.result = .{ .success = 1, .@"error" = null };
+            this.result = toBunValue(final_result);
         }
     }
 };
@@ -700,18 +697,21 @@ fn isLikelyEmbedObjectLiteral(code: []const u8) bool {
     return true;
 }
 
-pub export fn bun_eval_file(ctx: ?*BunContext, path_ptr: ?[*:0]const u8) callconv(.c) BunEvalResult {
-    const global = toGlobal(ctx) orelse return .{ .success = 0, .@"error" = "null context" };
-    const runtime = vmToRuntime(global.bunVM()) orelse return .{ .success = 0, .@"error" = "context has no runtime" };
+pub export fn bun_eval_file(ctx: ?*BunContext, path_ptr: ?[*:0]const u8) callconv(.c) BunValue {
+    const global = toGlobal(ctx) orelse return 0;
+    const runtime = vmToRuntime(global.bunVM()) orelse return 0;
     runtime.freeLastError();
 
-    const path = if (path_ptr) |p| std.mem.span(p) else return .{ .success = 0, .@"error" = "null path" };
+    const path = if (path_ptr) |p| std.mem.span(p) else {
+        runtime.setLastErrorBytes("null path");
+        return 0;
+    };
 
     var eval_ctx = EvalFileContext{
         .runtime = runtime,
         .global = global,
         .path = path,
-        .result = .{ .success = 0, .@"error" = "eval_file did not complete" },
+        .result = 0,
     };
     runtime.vm.runWithAPILock(EvalFileContext, &eval_ctx, EvalFileContext.run);
     return eval_ctx.result;
@@ -721,16 +721,16 @@ const EvalFileContext = struct {
     runtime: *BunRuntime,
     global: *JSGlobalObject,
     path: []const u8,
-    result: BunEvalResult,
+    result: BunValue,
 
     pub fn run(this: *EvalFileContext) void {
         const vm = this.runtime.vm;
 
         const promise = vm.loadEntryPoint(this.path) catch {
             if (this.global.tryTakeException()) |exc| {
-                this.result = this.runtime.captureException(this.global, exc);
+                this.runtime.captureException(this.global, exc);
             } else {
-                this.result = .{ .success = 0, .@"error" = "failed to load entry point" };
+                this.runtime.setLastErrorBytes("failed to load entry point");
             }
             return;
         };
@@ -742,23 +742,23 @@ const EvalFileContext = struct {
 
                 switch (promise.status()) {
                     .fulfilled => {
-                        this.result = .{ .success = 1, .@"error" = null };
+                        this.result = toBunValue(.js_undefined);
                     },
                     .rejected => {
                         const rejection = promise.result();
-                        this.result = this.runtime.captureException(this.global, rejection);
+                        this.runtime.captureException(this.global, rejection);
                     },
                     .pending => {
-                        this.result = .{ .success = 0, .@"error" = "entry point promise did not settle" };
+                        this.runtime.setLastErrorBytes("entry point promise did not settle");
                     },
                 }
             },
             .rejected => {
                 const rejection = promise.result();
-                this.result = this.runtime.captureException(this.global, rejection);
+                this.runtime.captureException(this.global, rejection);
             },
             .fulfilled => {
-                this.result = .{ .success = 1, .@"error" = null };
+                this.result = toBunValue(.js_undefined);
             },
         }
     }
@@ -1395,7 +1395,7 @@ pub export fn bun_call(
         // Capture the exception message into last_error_buf so the caller
         // can retrieve it with bun_last_error().
         if (runtime) |rt| {
-            _ = rt.captureException(global, global.takeException(err));
+            rt.captureException(global, global.takeException(err));
         } else {
             global.clearException();
         }
@@ -1404,7 +1404,7 @@ pub export fn bun_call(
 
     if (global.tryTakeException()) |exc| {
         if (runtime) |rt| {
-            _ = rt.captureException(global, exc);
+            rt.captureException(global, exc);
         } else {
             global.clearException();
         }
