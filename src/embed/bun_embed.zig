@@ -158,6 +158,32 @@ const BunRuntime = struct {
         else
             value;
 
+        // Non-Error thrown values are reported with side-effect-free, type-based
+        // messages. This avoids invoking coercion hooks like Symbol.toPrimitive
+        // while trying to format the exception itself.
+        if (!thrown_value.isAnyError()) {
+            if (thrown_value.isUndefined()) {
+                runtime.setLastErrorBytes("thrown value: undefined");
+            } else if (thrown_value.isNull()) {
+                runtime.setLastErrorBytes("thrown value: null");
+            } else if (thrown_value.isBoolean()) {
+                runtime.setLastErrorBytes(if (thrown_value.asBoolean()) "thrown value: true" else "thrown value: false");
+            } else if (thrown_value.isNumber()) {
+                runtime.setLastErrorBytes("thrown value: number");
+            } else if (thrown_value.isString()) {
+                runtime.setLastErrorBytes("thrown value: string");
+            } else if (thrown_value.isBigInt()) {
+                runtime.setLastErrorBytes("thrown value: bigint");
+            } else if (thrown_value.isSymbol()) {
+                runtime.setLastErrorBytes("thrown value: symbol");
+            } else if (thrown_value.isObject()) {
+                runtime.setLastErrorBytes("thrown value: object");
+            } else {
+                runtime.setLastErrorBytes("thrown value: unknown");
+            }
+            return;
+        }
+
         var array = std.Io.Writer.Allocating.init(bun.default_allocator);
         defer array.deinit();
 

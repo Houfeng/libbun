@@ -477,6 +477,33 @@ int main(void)
         }
     }
 
+    // Regression test: non-Error throws should not degrade into
+    // "TypeError: No default value" in bun_last_error().
+    printf("\n--- embed exception formatting regression ---\n");
+    if (bun_eval_string(
+            ctx,
+            "globalThis.__embed_to_primitive_called = false;"
+            "const thrown = {"
+            "  marker: 'embed-non-error-throw',"
+            "  [Symbol.toPrimitive]() {"
+            "    globalThis.__embed_to_primitive_called = true;"
+            "    return 'coerced';"
+            "  }"
+            "};"
+            "throw thrown;")
+        == BUN_EXCEPTION) {
+        const char* err = bun_last_error(ctx);
+        printf("bun_eval_string non-Error throw: %s\n", err ? err : "(no message)");
+
+        if (err && strstr(err, "No default value") != NULL) {
+            fprintf(stderr, "[FAIL] bun_last_error regressed to TypeError: No default value\n");
+        } else {
+            printf("[PASS] bun_last_error is stable for non-Error throws\n");
+        }
+    } else {
+        fprintf(stderr, "[FAIL] expected non-Error throw regression test to fail eval\n");
+    }
+
     // Queue host-driven async calls to demonstrate event loop integration.
     bun_call_async(ctx, async_tick_fn, BUN_UNDEFINED, 0, NULL);
     bun_call_async(ctx, async_tick_fn, BUN_UNDEFINED, 0, NULL);
