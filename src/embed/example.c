@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include "bun_embed.h"
 
@@ -533,6 +534,94 @@ int main(void)
         }
     } else {
         fprintf(stderr, "[FAIL] expected non-Error throw regression test to fail eval\n");
+    }
+
+    printf("\n--- embed eval_file regression ---\n");
+    {
+        {
+            BunRuntime* eval_file_rt = bun_initialize(NULL);
+            BunContext* eval_file_ctx = bun_context(eval_file_rt);
+            if (!eval_file_rt || !eval_file_ctx) {
+                fprintf(stderr, "[FAIL] unable to initialize runtime for eval_file success case\n");
+            } else {
+                char tmp_path[128];
+                snprintf(tmp_path, sizeof(tmp_path), "/tmp/bun-embed-ok-%ld.mjs", (long)getpid());
+                int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (fd < 0) {
+                    fprintf(stderr, "[FAIL] creating eval_file success module failed\n");
+                } else {
+                    const char* module_src = "globalThis.__embed_eval_file_ok = 41 + 1;\n";
+                    ssize_t wrote = write(fd, module_src, strlen(module_src));
+                    close(fd);
+
+                    if (wrote < 0 || (size_t)wrote != strlen(module_src)) {
+                        fprintf(stderr, "[FAIL] writing eval_file success module failed\n");
+                    } else {
+                        BunValue eval_file_ok = bun_eval_file(eval_file_ctx, tmp_path);
+                        if (eval_file_ok == BUN_EXCEPTION) {
+                            fprintf(stderr, "[FAIL] bun_eval_file(success) threw: %s\n", bun_last_error(eval_file_ctx));
+                        } else if (eval_file_ok != BUN_UNDEFINED) {
+                            fprintf(stderr, "[FAIL] bun_eval_file(success) returned %llu (expected BUN_UNDEFINED)\n", (unsigned long long)eval_file_ok);
+                        } else {
+                            BunValue ok_value = bun_eval_string(eval_file_ctx, "globalThis.__embed_eval_file_ok");
+                            if (ok_value == BUN_EXCEPTION) {
+                                fprintf(stderr, "[FAIL] reading __embed_eval_file_ok threw: %s\n", bun_last_error(eval_file_ctx));
+                            } else {
+                                double n = bun_to_number(eval_file_ctx, ok_value);
+                                if (n == 42.0) {
+                                    printf("[PASS] bun_eval_file(success) -> BUN_UNDEFINED and module executed\n");
+                                } else {
+                                    fprintf(stderr, "[FAIL] __embed_eval_file_ok = %g (expected 42)\n", n);
+                                }
+                            }
+                        }
+                    }
+
+                    unlink(tmp_path);
+                }
+
+                bun_destroy(eval_file_rt);
+            }
+        }
+
+        {
+            BunRuntime* eval_file_rt = bun_initialize(NULL);
+            BunContext* eval_file_ctx = bun_context(eval_file_rt);
+            if (!eval_file_rt || !eval_file_ctx) {
+                fprintf(stderr, "[FAIL] unable to initialize runtime for eval_file throw case\n");
+            } else {
+                char tmp_path[128];
+                snprintf(tmp_path, sizeof(tmp_path), "/tmp/bun-embed-throw-%ld.mjs", (long)getpid());
+                int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (fd < 0) {
+                    fprintf(stderr, "[FAIL] creating eval_file throw module failed\n");
+                } else {
+                    const char* module_src = "throw { marker: 'embed-eval-file-throw' };\n";
+                    ssize_t wrote = write(fd, module_src, strlen(module_src));
+                    close(fd);
+
+                    if (wrote < 0 || (size_t)wrote != strlen(module_src)) {
+                        fprintf(stderr, "[FAIL] writing eval_file throw module failed\n");
+                    } else {
+                        BunValue eval_file_throw = bun_eval_file(eval_file_ctx, tmp_path);
+                        if (eval_file_throw != BUN_EXCEPTION) {
+                            fprintf(stderr, "[FAIL] bun_eval_file(throw) unexpectedly succeeded\n");
+                        } else {
+                            const char* err = bun_last_error(eval_file_ctx);
+                            if (err && strstr(err, "No default value") != NULL) {
+                                fprintf(stderr, "[FAIL] bun_eval_file error regressed to TypeError: No default value\n");
+                            } else {
+                                printf("[PASS] bun_eval_file(non-Error throw) has stable error text\n");
+                            }
+                        }
+                    }
+
+                    unlink(tmp_path);
+                }
+
+                bun_destroy(eval_file_rt);
+            }
+        }
     }
 
     // Queue host-driven async calls to demonstrate event loop integration.
