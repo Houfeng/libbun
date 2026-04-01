@@ -640,6 +640,12 @@ fn transformForEmbedEval(global: *JSGlobalObject, code: []const u8) ?[]u8 {
     }
 
     const is_object_literal = isLikelyEmbedObjectLiteral(code);
+    if (!is_object_literal) {
+        // Keep normal expressions/statements untouched so bun_eval_string()
+        // returns the actual completion value (for example 1+1 => 2).
+        return null;
+    }
+
     const processed_code = if (is_object_literal)
         std.fmt.allocPrint(global.allocator(), "({s})", .{code}) catch return null
     else
