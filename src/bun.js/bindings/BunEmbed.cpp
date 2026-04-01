@@ -26,8 +26,8 @@
 namespace Bun {
 using namespace JSC;
 
-using BunEmbedGetterFn = uint64_t (*)(void* ctx, uint64_t this_value);
-using BunEmbedSetterFn = void (*)(void* ctx, uint64_t this_value, uint64_t value);
+using BunEmbedGetterFn = uint64_t (*)(void* ctx, uint64_t this_value, void* userdata);
+using BunEmbedSetterFn = void (*)(void* ctx, uint64_t this_value, uint64_t value, void* userdata);
 using BunEmbedFinalizerFn = void (*)(void* userdata);
 using BunEmbedClassMethodFn = uint64_t (*)(void* ctx, uint64_t this_value, void* native_ptr, int argc, const uint64_t* argv, void* userdata);
 using BunEmbedClassGetterFn = uint64_t (*)(void* ctx, uint64_t this_value, void* native_ptr, void* userdata);
@@ -634,6 +634,7 @@ struct AccessorKeyHash {
 struct AccessorEntry {
     BunEmbedGetterFn getter;
     BunEmbedSetterFn setter;
+    void* userdata;
 };
 
 static std::unordered_map<AccessorKey, AccessorEntry, AccessorKeyHash> s_accessor_map;
@@ -667,7 +668,7 @@ JSC_DEFINE_CUSTOM_GETTER(BunEmbed_customGetter, (JSGlobalObject * globalObject, 
         entry = it->second;
     }
 
-    return static_cast<EncodedJSValue>(entry.getter(static_cast<void*>(globalObject), static_cast<uint64_t>(thisValue)));
+    return static_cast<EncodedJSValue>(entry.getter(static_cast<void*>(globalObject), static_cast<uint64_t>(thisValue), entry.userdata));
 }
 
 JSC_DEFINE_CUSTOM_SETTER(BunEmbed_customSetter, (JSGlobalObject * globalObject, EncodedJSValue thisValue, EncodedJSValue value, PropertyName propertyName))
@@ -681,7 +682,7 @@ JSC_DEFINE_CUSTOM_SETTER(BunEmbed_customSetter, (JSGlobalObject * globalObject, 
         entry = it->second;
     }
 
-    entry.setter(static_cast<void*>(globalObject), static_cast<uint64_t>(thisValue), static_cast<uint64_t>(value));
+    entry.setter(static_cast<void*>(globalObject), static_cast<uint64_t>(thisValue), static_cast<uint64_t>(value), entry.userdata);
     return true;
 }
 
@@ -692,6 +693,7 @@ extern "C" bool BunEmbed__defineCustomAccessor(
     size_t keyLen,
     BunEmbedGetterFn getter,
     BunEmbedSetterFn setter,
+    void* userdata,
     uint32_t flags)
 {
     if (!globalObject || !keyPtr || keyLen == 0 || !getter)
@@ -711,6 +713,7 @@ extern "C" bool BunEmbed__defineCustomAccessor(
         s_accessor_map[key] = AccessorEntry {
             .getter = getter,
             .setter = setter,
+            .userdata = userdata,
         };
     }
 

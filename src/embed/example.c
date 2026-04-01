@@ -281,15 +281,17 @@ static BunValue counter_inc(BunContext* ctx, int argc, const BunValue* argv, voi
     return bun_int32(counter->value);
 }
 
-static BunValue counter_get(BunContext* ctx, BunValue this_value)
+static BunValue counter_get(BunContext* ctx, BunValue this_value, void* userdata)
 {
+    (void)userdata;
     Counter* counter = (Counter*)bun_get_opaque(ctx, this_value);
     if (!counter) return BUN_UNDEFINED;
     return bun_int32(counter->value);
 }
 
-static void counter_set(BunContext* ctx, BunValue this_value, BunValue value)
+static void counter_set(BunContext* ctx, BunValue this_value, BunValue value, void* userdata)
 {
+    (void)userdata;
     Counter* counter = (Counter*)bun_get_opaque(ctx, this_value);
     if (!counter) return;
     counter->value = bun_to_int32(value);
@@ -384,7 +386,7 @@ int main(void)
     bun_set_opaque(ctx, counter_obj, counter);
     bun_define_finalizer(ctx, counter_obj, counter_finalize, counter);
     bun_set(ctx, counter_obj, "inc", 3, inc_fn);
-    bun_define_accessor(ctx, counter_obj, "value", 5, counter_get, counter_set, 0, 0, 0);
+    bun_define_accessor(ctx, counter_obj, "value", 5, counter_get, counter_set, NULL, 0, 0, 0);
     bun_set(ctx, global, "counter", 7, counter_obj);
 
     BunClass* view_class = bun_class_register(ctx, &VIEW_CLASS, NULL);

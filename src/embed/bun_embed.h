@@ -49,10 +49,10 @@ typedef struct {
 typedef BunValue (*BunHostFn)(BunContext* ctx, int argc, const BunValue* argv, void* userdata);
 
 /// Custom getter callback for bun_define_accessor().
-typedef BunValue (*BunGetterFn)(BunContext* ctx, BunValue this_value);
+typedef BunValue (*BunGetterFn)(BunContext* ctx, BunValue this_value, void* userdata);
 
 /// Custom setter callback for bun_define_accessor().
-typedef void (*BunSetterFn)(BunContext* ctx, BunValue this_value, BunValue value);
+typedef void (*BunSetterFn)(BunContext* ctx, BunValue this_value, BunValue value, void* userdata);
 
 /// Finalizer callback for bun_define_finalizer().
 ///
@@ -443,6 +443,7 @@ int bun_define_getter(
     const char* key,
     size_t key_len,
     BunGetterFn getter,
+    void* userdata,
     int dont_enum,
     int dont_delete);
 
@@ -452,6 +453,7 @@ int bun_define_setter(
     const char* key,
     size_t key_len,
     BunSetterFn setter,
+    void* userdata,
     int dont_enum,
     int dont_delete);
 
@@ -462,6 +464,7 @@ int bun_define_accessor(
     size_t key_len,
     BunGetterFn getter,
     BunSetterFn setter,
+    void* userdata,
     int read_only,
     int dont_enum,
     int dont_delete);

@@ -20,8 +20,8 @@ const BunContext = opaque {};
 const BunClass = opaque {};
 
 const BunHostFn = *const fn (?*BunContext, c_int, ?[*]const BunValue, ?*anyopaque) callconv(.c) BunValue;
-const BunGetterFn = *const fn (?*BunContext, BunValue) callconv(.c) BunValue;
-const BunSetterFn = *const fn (?*BunContext, BunValue, BunValue) callconv(.c) void;
+const BunGetterFn = *const fn (?*BunContext, BunValue, ?*anyopaque) callconv(.c) BunValue;
+const BunSetterFn = *const fn (?*BunContext, BunValue, BunValue, ?*anyopaque) callconv(.c) void;
 const BunFinalizerFn = *const fn (?*anyopaque) callconv(.c) void;
 const BunClassMethodFn = *const fn (?*BunContext, BunValue, ?*anyopaque, c_int, ?[*]const BunValue, ?*anyopaque) callconv(.c) BunValue;
 const BunClassGetterFn = *const fn (?*BunContext, BunValue, ?*anyopaque, ?*anyopaque) callconv(.c) BunValue;
@@ -312,6 +312,7 @@ extern fn BunEmbed__defineCustomAccessor(
     key_len: usize,
     getter: ?BunGetterFn,
     setter: ?BunSetterFn,
+    userdata: ?*anyopaque,
     flags: u32,
 ) bool;
 
@@ -1244,6 +1245,7 @@ pub export fn bun_define_getter(
     key_ptr: ?[*]const u8,
     key_len: usize,
     getter: ?BunGetterFn,
+    userdata: ?*anyopaque,
     dont_enum: c_int,
     dont_delete: c_int,
 ) callconv(.c) c_int {
@@ -1254,6 +1256,7 @@ pub export fn bun_define_getter(
         key_len,
         getter,
         null,
+        userdata,
         1,
         dont_enum,
         dont_delete,
@@ -1266,6 +1269,7 @@ pub export fn bun_define_setter(
     key_ptr: ?[*]const u8,
     key_len: usize,
     setter: ?BunSetterFn,
+    userdata: ?*anyopaque,
     dont_enum: c_int,
     dont_delete: c_int,
 ) callconv(.c) c_int {
@@ -1276,6 +1280,7 @@ pub export fn bun_define_setter(
         key_len,
         null,
         setter,
+        userdata,
         0,
         dont_enum,
         dont_delete,
@@ -1289,6 +1294,7 @@ pub export fn bun_define_accessor(
     key_len: usize,
     getter: ?BunGetterFn,
     setter: ?BunSetterFn,
+    userdata: ?*anyopaque,
     read_only: c_int,
     dont_enum: c_int,
     dont_delete: c_int,
@@ -1301,7 +1307,7 @@ pub export fn bun_define_accessor(
     if (dont_enum != 0) flags |= BUN_ACCESSOR_DONT_ENUM;
     if (dont_delete != 0) flags |= BUN_ACCESSOR_DONT_DELETE;
 
-    return if (BunEmbed__defineCustomAccessor(global, toJSValue(object), key, key_len, getter, setter, flags)) 1 else 0;
+    return if (BunEmbed__defineCustomAccessor(global, toJSValue(object), key, key_len, getter, setter, userdata, flags)) 1 else 0;
 }
 
 pub export fn bun_define_finalizer(
