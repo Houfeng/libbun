@@ -49,6 +49,8 @@ typedef void (*BunSetterFn)(BunContext* ctx, BunValue this_value, BunValue value
 ///
 /// This runs during GC finalization. It must not call back into Bun/JS APIs.
 /// Use it only to release native resources associated with the object.
+/// Each object may have at most one user finalizer registered via
+/// bun_define_finalizer().
 typedef void (*BunFinalizerFn)(void* userdata);
 
 /// Native instance method callback for bun_class_register().
@@ -470,6 +472,14 @@ int bun_define_accessor(
     int dont_enum,
     int dont_delete);
 
+/// Attach a GC finalizer to a JavaScript object.
+///
+/// Each object may have at most one user finalizer attached through this API.
+/// Repeated calls for the same object return 0 and leave the existing
+/// finalizer unchanged; they do not replace or stack finalizers.
+///
+/// If the underlying attach operation fails, no finalizer is recorded and the
+/// caller may retry.
 int bun_define_finalizer(
     BunContext* ctx,
     BunValue object,

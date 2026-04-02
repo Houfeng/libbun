@@ -113,6 +113,8 @@ const OpaqueEntry = struct {
     /// Native pointer stored by bun_set_opaque().
     opaque_ptr: ?*anyopaque = null,
     /// Whether a user finalizer has already been attached via bun_define_finalizer().
+    /// This is only set after the underlying attach succeeds so callers may retry
+    /// after an attach failure.
     finalizer_attached: bool = false,
 };
 
@@ -1299,9 +1301,10 @@ pub export fn bun_define_finalizer(
     const result = runtime.opaque_map.getOrPut(bun.default_allocator, obj) catch return 0;
     if (result.found_existing and result.value_ptr.finalizer_attached) return 0;
     if (!result.found_existing) result.value_ptr.* = .{};
-    result.value_ptr.finalizer_attached = true;
+    if (!BunEmbed__defineFinalizer(global, obj, callback, userdata)) return 0;
 
-    return if (BunEmbed__defineFinalizer(global, obj, callback, userdata)) 1 else 0;
+    result.value_ptr.finalizer_attached = true;
+    return 1;
 }
 
 pub export fn bun_set_prototype(ctx: ?*BunContext, object: BunValue, proto: BunValue) callconv(.c) c_int {
