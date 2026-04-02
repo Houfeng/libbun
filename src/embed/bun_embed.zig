@@ -370,8 +370,10 @@ extern fn BunEmbed__defineCustomAccessor(
     key_ptr: [*]const u8,
     key_len: usize,
     getter: ?BunGetterFn,
+    getter_userdata: ?*anyopaque,
     setter: ?BunSetterFn,
-    userdata: ?*anyopaque,
+    setter_userdata: ?*anyopaque,
+    update_mask: u8,
     flags: u32,
 ) bool;
 
@@ -462,6 +464,8 @@ extern fn BunEmbed__classConstructor(
 const BUN_ACCESSOR_READ_ONLY: u32 = 1 << 0;
 const BUN_ACCESSOR_DONT_ENUM: u32 = 1 << 1;
 const BUN_ACCESSOR_DONT_DELETE: u32 = 1 << 2;
+const BUN_ACCESSOR_UPDATE_GETTER: u8 = 1 << 0;
+const BUN_ACCESSOR_UPDATE_SETTER: u8 = 1 << 1;
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -1224,18 +1228,26 @@ pub export fn bun_define_getter(
     dont_enum: c_int,
     dont_delete: c_int,
 ) callconv(.c) c_int {
-    return bun_define_accessor(
-        ctx,
-        object,
-        key_ptr,
+    const global = toGlobal(ctx) orelse return 0;
+    const key = key_ptr orelse return 0;
+    const callback = getter orelse return 0;
+
+    var flags: u32 = 0;
+    if (dont_enum != 0) flags |= BUN_ACCESSOR_DONT_ENUM;
+    if (dont_delete != 0) flags |= BUN_ACCESSOR_DONT_DELETE;
+
+    return if (BunEmbed__defineCustomAccessor(
+        global,
+        toJSValue(object),
+        key,
         key_len,
-        getter,
-        null,
+        callback,
         userdata,
-        1,
-        dont_enum,
-        dont_delete,
-    );
+        null,
+        null,
+        BUN_ACCESSOR_UPDATE_GETTER,
+        flags,
+    )) 1 else 0;
 }
 
 pub export fn bun_define_setter(
@@ -1248,18 +1260,26 @@ pub export fn bun_define_setter(
     dont_enum: c_int,
     dont_delete: c_int,
 ) callconv(.c) c_int {
-    return bun_define_accessor(
-        ctx,
-        object,
-        key_ptr,
+    const global = toGlobal(ctx) orelse return 0;
+    const key = key_ptr orelse return 0;
+    const callback = setter orelse return 0;
+
+    var flags: u32 = 0;
+    if (dont_enum != 0) flags |= BUN_ACCESSOR_DONT_ENUM;
+    if (dont_delete != 0) flags |= BUN_ACCESSOR_DONT_DELETE;
+
+    return if (BunEmbed__defineCustomAccessor(
+        global,
+        toJSValue(object),
+        key,
         key_len,
         null,
-        setter,
+        null,
+        callback,
         userdata,
-        0,
-        dont_enum,
-        dont_delete,
-    );
+        BUN_ACCESSOR_UPDATE_SETTER,
+        flags,
+    )) 1 else 0;
 }
 
 pub export fn bun_define_accessor(
@@ -1276,13 +1296,29 @@ pub export fn bun_define_accessor(
 ) callconv(.c) c_int {
     const global = toGlobal(ctx) orelse return 0;
     const key = key_ptr orelse return 0;
+    if (getter == null and setter == null) return 0;
 
     var flags: u32 = 0;
     if (read_only != 0) flags |= BUN_ACCESSOR_READ_ONLY;
     if (dont_enum != 0) flags |= BUN_ACCESSOR_DONT_ENUM;
     if (dont_delete != 0) flags |= BUN_ACCESSOR_DONT_DELETE;
 
-    return if (BunEmbed__defineCustomAccessor(global, toJSValue(object), key, key_len, getter, setter, userdata, flags)) 1 else 0;
+    var update_mask: u8 = 0;
+    if (getter != null) update_mask |= BUN_ACCESSOR_UPDATE_GETTER;
+    if (setter != null) update_mask |= BUN_ACCESSOR_UPDATE_SETTER;
+
+    return if (BunEmbed__defineCustomAccessor(
+        global,
+        toJSValue(object),
+        key,
+        key_len,
+        getter,
+        userdata,
+        setter,
+        userdata,
+        update_mask,
+        flags,
+    )) 1 else 0;
 }
 
 pub export fn bun_define_finalizer(

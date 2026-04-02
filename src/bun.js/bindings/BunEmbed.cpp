@@ -632,9 +632,15 @@ struct AccessorKeyHash {
 };
 
 struct AccessorEntry {
-    BunEmbedGetterFn getter;
-    BunEmbedSetterFn setter;
-    void* userdata;
+    BunEmbedGetterFn getter { nullptr };
+    void* getter_userdata { nullptr };
+    BunEmbedSetterFn setter { nullptr };
+    void* setter_userdata { nullptr };
+};
+
+enum BunEmbedAccessorUpdateMask : uint8_t {
+    BunEmbedAccessorUpdateGetter = 1 << 0,
+    BunEmbedAccessorUpdateSetter = 1 << 1,
 };
 
 static std::unordered_map<AccessorKey, AccessorEntry, AccessorKeyHash> s_accessor_map;
@@ -659,7 +665,7 @@ static AccessorKey makeKey(EncodedJSValue thisValue, PropertyName propertyName)
 
 JSC_DEFINE_CUSTOM_GETTER(BunEmbed_customGetter, (JSGlobalObject * globalObject, EncodedJSValue thisValue, PropertyName propertyName))
 {
-    AccessorEntry entry { nullptr, nullptr };
+    AccessorEntry entry {};
     {
         std::lock_guard<std::mutex> lock(s_accessor_map_mutex);
         auto it = s_accessor_map.find(makeKey(thisValue, propertyName));
@@ -668,12 +674,12 @@ JSC_DEFINE_CUSTOM_GETTER(BunEmbed_customGetter, (JSGlobalObject * globalObject, 
         entry = it->second;
     }
 
-    return static_cast<EncodedJSValue>(entry.getter(static_cast<void*>(globalObject), static_cast<uint64_t>(thisValue), entry.userdata));
+    return static_cast<EncodedJSValue>(entry.getter(static_cast<void*>(globalObject), static_cast<uint64_t>(thisValue), entry.getter_userdata));
 }
 
 JSC_DEFINE_CUSTOM_SETTER(BunEmbed_customSetter, (JSGlobalObject * globalObject, EncodedJSValue thisValue, EncodedJSValue value, PropertyName propertyName))
 {
-    AccessorEntry entry { nullptr, nullptr };
+    AccessorEntry entry {};
     {
         std::lock_guard<std::mutex> lock(s_accessor_map_mutex);
         auto it = s_accessor_map.find(makeKey(thisValue, propertyName));
@@ -682,7 +688,7 @@ JSC_DEFINE_CUSTOM_SETTER(BunEmbed_customSetter, (JSGlobalObject * globalObject, 
         entry = it->second;
     }
 
-    entry.setter(static_cast<void*>(globalObject), static_cast<uint64_t>(thisValue), static_cast<uint64_t>(value), entry.userdata);
+    entry.setter(static_cast<void*>(globalObject), static_cast<uint64_t>(thisValue), static_cast<uint64_t>(value), entry.setter_userdata);
     return true;
 }
 
@@ -692,11 +698,17 @@ extern "C" bool BunEmbed__defineCustomAccessor(
     const char* keyPtr,
     size_t keyLen,
     BunEmbedGetterFn getter,
+    void* getterUserdata,
     BunEmbedSetterFn setter,
-    void* userdata,
+    void* setterUserdata,
+    uint8_t updateMask,
     uint32_t flags)
 {
-    if (!globalObject || !keyPtr || keyLen == 0 || !getter)
+    if (!globalObject || !keyPtr || keyLen == 0 || !updateMask)
+        return false;
+    if ((updateMask & BunEmbedAccessorUpdateGetter) && !getter)
+        return false;
+    if ((updateMask & BunEmbedAccessorUpdateSetter) && !setter)
         return false;
 
     JSValue value = JSValue::decode(objectValue);
@@ -704,17 +716,31 @@ extern "C" bool BunEmbed__defineCustomAccessor(
     if (!object)
         return false;
 
+    AccessorEntry entry {};
     {
         std::lock_guard<std::mutex> lock(s_accessor_map_mutex);
         AccessorKey key {
             .object_ptr = reinterpret_cast<uintptr_t>(object),
             .name = std::string(keyPtr, keyLen),
         };
-        s_accessor_map[key] = AccessorEntry {
-            .getter = getter,
-            .setter = setter,
-            .userdata = userdata,
-        };
+
+        if (auto it = s_accessor_map.find(key); it != s_accessor_map.end()) {
+            entry = it->second;
+        }
+
+        if (updateMask & BunEmbedAccessorUpdateGetter) {
+            entry.getter = getter;
+            entry.getter_userdata = getterUserdata;
+        }
+        if (updateMask & BunEmbedAccessorUpdateSetter) {
+            entry.setter = setter;
+            entry.setter_userdata = setterUserdata;
+        }
+
+        if (!entry.getter && !entry.setter)
+            return false;
+
+        s_accessor_map[key] = entry;
     }
 
     VM& vm = globalObject->vm();
@@ -723,14 +749,16 @@ extern "C" bool BunEmbed__defineCustomAccessor(
         return false;
 
     unsigned attributes = 0;
-    if (flags & (1u << 0))
+    const bool has_setter = entry.setter != nullptr;
+    const bool auto_read_only = (updateMask == BunEmbedAccessorUpdateGetter) && !has_setter;
+    if ((flags & (1u << 0)) || auto_read_only)
         attributes |= PropertyAttribute::ReadOnly;
     if (flags & (1u << 1))
         attributes |= PropertyAttribute::DontEnum;
     if (flags & (1u << 2))
         attributes |= PropertyAttribute::DontDelete;
 
-    auto* custom = CustomGetterSetter::create(vm, BunEmbed_customGetter, setter ? BunEmbed_customSetter : nullptr);
+    auto* custom = CustomGetterSetter::create(vm, BunEmbed_customGetter, has_setter ? BunEmbed_customSetter : nullptr);
     object->putDirectCustomAccessor(vm, Identifier::fromString(vm, keyString), custom, attributes);
     return true;
 }

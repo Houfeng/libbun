@@ -20,6 +20,10 @@ typedef struct {
 } Counter;
 
 typedef struct {
+    int delta;
+} AccessorDelta;
+
+typedef struct {
     int x;
     int y;
 } NativeView;
@@ -301,6 +305,24 @@ static void counter_set(BunContext* ctx, BunValue this_value, BunValue value, vo
     counter->value = bun_to_int32(value);
 }
 
+static BunValue accessor_probe_get(BunContext* ctx, BunValue this_value, void* userdata)
+{
+    (void)ctx;
+    Counter* counter = (Counter*)bun_get_opaque(ctx, this_value);
+    AccessorDelta* delta = (AccessorDelta*)userdata;
+    if (!counter) return BUN_UNDEFINED;
+    return bun_int32(counter->value + (delta ? delta->delta : 0));
+}
+
+static void accessor_probe_set(BunContext* ctx, BunValue this_value, BunValue value, void* userdata)
+{
+    (void)ctx;
+    Counter* counter = (Counter*)bun_get_opaque(ctx, this_value);
+    AccessorDelta* delta = (AccessorDelta*)userdata;
+    if (!counter) return;
+    counter->value = bun_to_int32(value) + (delta ? delta->delta : 0);
+}
+
 static BunValue native_greet(BunContext* ctx, int argc, const BunValue* argv, void* userdata)
 {
     (void)userdata;
@@ -392,6 +414,25 @@ int main(void)
     bun_set(ctx, counter_obj, "inc", 3, inc_fn);
     bun_define_accessor(ctx, counter_obj, "value", 5, counter_get, counter_set, NULL, 0, 0, 0);
     bun_set(ctx, global, "counter", 7, counter_obj);
+
+    Counter accessor_counter = { .value = 1 };
+    AccessorDelta score_get_delta = { .delta = 100 };
+    AccessorDelta write_only_delta = { .delta = 7 };
+    AccessorDelta score_set_delta = { .delta = 20 };
+
+    BunValue accessor_obj = bun_object(ctx);
+    bun_set_opaque(ctx, accessor_obj, &accessor_counter);
+    if (!bun_define_getter(ctx, accessor_obj, "score", 5, accessor_probe_get, &score_get_delta, 0, 0)) {
+        fprintf(stderr, "Failed to define getter-only accessor\n");
+        bun_destroy(rt);
+        return 1;
+    }
+    if (!bun_define_setter(ctx, accessor_obj, "writeOnly", 9, accessor_probe_set, &write_only_delta, 0, 0)) {
+        fprintf(stderr, "Failed to define setter-only accessor\n");
+        bun_destroy(rt);
+        return 1;
+    }
+    bun_set(ctx, global, "accessorProbe", 13, accessor_obj);
 
     BunClass* view_class = bun_class_register(ctx, &VIEW_CLASS, NULL);
     BunClass* text_class = bun_class_register(ctx, &TEXT_CLASS, view_class);
@@ -495,6 +536,42 @@ int main(void)
             } else {
                 fprintf(stderr, "[FAIL] bun_eval_string(syntax error) returned unexpected message: %s\n", err ? err : "(null)");
             }
+        }
+    }
+
+    printf("\n--- embed accessor merge regression ---\n");
+    {
+        BunValue getter_only = bun_eval_string(ctx, BUN_LITERAL("(accessorProbe.score)"));
+        if (getter_only == BUN_EXCEPTION) {
+            fprintf(stderr, "[FAIL] getter-only accessor threw: %s\n", bun_last_error(ctx, NULL));
+        } else if (bun_to_int32(getter_only) == 101) {
+            printf("[PASS] bun_define_getter supports getter-only\n");
+        } else {
+            fprintf(stderr, "[FAIL] getter-only accessor returned %d (expected 101)\n", bun_to_int32(getter_only));
+        }
+    }
+
+    {
+        BunValue setter_only = bun_eval_string(ctx, BUN_LITERAL("(accessorProbe.writeOnly = 4, typeof accessorProbe.writeOnly === 'undefined' ? accessorProbe.score : -1)"));
+        if (setter_only == BUN_EXCEPTION) {
+            fprintf(stderr, "[FAIL] setter-only accessor threw: %s\n", bun_last_error(ctx, NULL));
+        } else if (bun_to_int32(setter_only) == 111) {
+            printf("[PASS] bun_define_setter supports setter-only\n");
+        } else {
+            fprintf(stderr, "[FAIL] setter-only accessor returned %d (expected 111)\n", bun_to_int32(setter_only));
+        }
+    }
+
+    if (!bun_define_setter(ctx, accessor_obj, "score", 5, accessor_probe_set, &score_set_delta, 0, 0)) {
+        fprintf(stderr, "[FAIL] failed to add setter to existing getter accessor\n");
+    } else {
+        BunValue merged_accessor = bun_eval_string(ctx, BUN_LITERAL("(accessorProbe.score = 5, accessorProbe.score)"));
+        if (merged_accessor == BUN_EXCEPTION) {
+            fprintf(stderr, "[FAIL] merged accessor threw: %s\n", bun_last_error(ctx, NULL));
+        } else if (bun_to_int32(merged_accessor) == 125) {
+            printf("[PASS] getter/setter userdata remain independent\n");
+        } else {
+            fprintf(stderr, "[FAIL] merged accessor returned %d (expected 125)\n", bun_to_int32(merged_accessor));
         }
     }
 

@@ -440,6 +440,12 @@ BunValue bun_get(BunContext* ctx, BunValue object, const char* key, size_t key_l
 int bun_set_index(BunContext* ctx, BunValue object, uint32_t index, BunValue value);
 BunValue bun_get_index(BunContext* ctx, BunValue object, uint32_t index);
 
+/// Define or replace only the getter half of an accessor property.
+///
+/// Getter-only properties are allowed. Repeated calls replace only the getter
+/// callback and getter userdata; any existing setter and setter userdata are
+/// preserved.
+
 int bun_define_getter(
     BunContext* ctx,
     BunValue object,
@@ -450,6 +456,12 @@ int bun_define_getter(
     int dont_enum,
     int dont_delete);
 
+/// Define or replace only the setter half of an accessor property.
+///
+/// Setter-only properties are allowed. If no getter is defined, reads return
+/// `undefined`. Repeated calls replace only the setter callback and setter
+/// userdata; any existing getter and getter userdata are preserved.
+
 int bun_define_setter(
     BunContext* ctx,
     BunValue object,
@@ -459,6 +471,13 @@ int bun_define_setter(
     void* userdata,
     int dont_enum,
     int dont_delete);
+
+/// Define or replace an accessor property.
+///
+/// `getter` and `setter` may be provided independently so long as at least one
+/// callback is non-NULL. The same `userdata` pointer is passed to both sides.
+/// Use bun_define_getter() / bun_define_setter() when getter and setter should
+/// keep separate userdata or be updated independently.
 
 int bun_define_accessor(
     BunContext* ctx,
