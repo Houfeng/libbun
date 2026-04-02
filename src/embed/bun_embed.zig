@@ -590,12 +590,12 @@ pub export fn bun_context(rt: ?*BunRuntime) callconv(.c) ?*BunContext {
 // Evaluation
 // ---------------------------------------------------------------------------
 
-pub export fn bun_eval_string(ctx: ?*BunContext, code_ptr: ?[*:0]const u8) callconv(.c) BunValue {
+pub export fn bun_eval_string(ctx: ?*BunContext, code_ptr: ?[*]const u8, code_len: usize) callconv(.c) BunValue {
     const global = toGlobal(ctx) orelse return 0;
     const runtime = vmToRuntime(global.bunVM()) orelse return 0;
     runtime.freeLastError();
 
-    const code = if (code_ptr) |p| std.mem.span(p) else {
+    const code = if (code_ptr) |p| p[0..code_len] else {
         runtime.setLastErrorBytes("null code");
         return 0;
     };
@@ -664,15 +664,20 @@ const EvalContext = struct {
     }
 };
 
-pub export fn bun_eval_file(ctx: ?*BunContext, path_ptr: ?[*:0]const u8) callconv(.c) BunValue {
+pub export fn bun_eval_file(ctx: ?*BunContext, path_ptr: ?[*]const u8, path_len: usize) callconv(.c) BunValue {
     const global = toGlobal(ctx) orelse return 0;
     const runtime = vmToRuntime(global.bunVM()) orelse return 0;
     runtime.freeLastError();
 
-    const path = if (path_ptr) |p| std.mem.span(p) else {
+    const path = if (path_ptr) |p| p[0..path_len] else {
         runtime.setLastErrorBytes("null path");
         return 0;
     };
+
+    if (std.mem.indexOfScalar(u8, path, 0) != null) {
+        runtime.setLastErrorBytes("path contains embedded NUL");
+        return 0;
+    }
 
     var eval_ctx = EvalFileContext{
         .runtime = runtime,
@@ -909,13 +914,14 @@ fn hostFnFinalizer(userdata: ?*anyopaque) callconv(.c) void {
 
 pub export fn bun_function(
     ctx: ?*BunContext,
-    name_ptr: ?[*:0]const u8,
+    name_ptr: ?[*]const u8,
+    name_len: usize,
     native_fn: ?BunHostFn,
     userdata: ?*anyopaque,
     arg_count: c_int,
 ) callconv(.c) BunValue {
     const global = toGlobal(ctx) orelse return toBunValue(.js_undefined);
-    const name = if (name_ptr) |p| std.mem.span(p) else return toBunValue(.js_undefined);
+    const name = if (name_ptr) |p| p[0..name_len] else return toBunValue(.js_undefined);
     const fn_ptr = native_fn orelse return toBunValue(.js_undefined);
     const runtime = vmToRuntime(global.bunVM()) orelse return toBunValue(.js_undefined);
 
@@ -1344,7 +1350,7 @@ pub export fn bun_call(
 ) callconv(.c) BunValue {
     const global = toGlobal(ctx) orelse return 0;
     const runtime = vmToRuntime(global.bunVM());
-    // Clear any stale error so bun_last_error() is NULL after a successful call.
+    // Clear any stale error so bun_last_error(ctx, ...) is NULL after a successful call.
     if (runtime) |rt| rt.freeLastError();
 
     const function = toJSValue(fn_value);
@@ -1360,7 +1366,7 @@ pub export fn bun_call(
 
     const result = function.call(global, toJSValue(this_value), args) catch |err| {
         // Capture the exception message into last_error_buf so the caller
-        // can retrieve it with bun_last_error().
+        // can retrieve it with bun_last_error(ctx, ...).
         if (runtime) |rt| {
             rt.captureException(global, global.takeException(err));
         } else {
@@ -1385,10 +1391,18 @@ pub export fn bun_call(
 }
 
 /// Return the latest error string stored by bun_call() or bun_eval*().
-pub export fn bun_last_error(ctx: ?*BunContext) callconv(.c) ?[*:0]const u8 {
+pub export fn bun_last_error(ctx: ?*BunContext, out_len: ?*usize) callconv(.c) ?[*:0]const u8 {
+    if (out_len) |len_ptr| len_ptr.* = 0;
+
     const global = toGlobal(ctx) orelse return null;
     const runtime = vmToRuntime(global.bunVM()) orelse return null;
-    return runtime.last_error_buf;
+
+    if (runtime.last_error_buf) |buf| {
+        if (out_len) |len_ptr| len_ptr.* = std.mem.len(buf);
+        return buf;
+    }
+
+    return null;
 }
 
 pub export fn bun_call_async(

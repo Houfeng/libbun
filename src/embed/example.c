@@ -12,6 +12,9 @@
 #include <unistd.h>
 #include "bun_embed.h"
 
+#define BUN_LITERAL(str) (str), sizeof(str) - 1
+#define BUN_CSTR(str) (str), strlen(str)
+
 typedef struct {
     int value;
 } Counter;
@@ -366,9 +369,9 @@ int main(void)
     BunValue global = bun_global(ctx);
     int async_tick_count = 0;
 
-    BunValue add_fn = bun_function(ctx, "nativeAdd", native_add, NULL, 2);
-    BunValue greet_fn = bun_function(ctx, "nativeGreet", native_greet, NULL, 1);
-    BunValue async_tick_fn = bun_function(ctx, "nativeAsyncTick", native_async_tick, &async_tick_count, 0);
+    BunValue add_fn = bun_function(ctx, BUN_LITERAL("nativeAdd"), native_add, NULL, 2);
+    BunValue greet_fn = bun_function(ctx, BUN_LITERAL("nativeGreet"), native_greet, NULL, 1);
+    BunValue async_tick_fn = bun_function(ctx, BUN_LITERAL("nativeAsyncTick"), native_async_tick, &async_tick_count, 0);
 
     bun_set(ctx, global, "nativeAdd", 9, add_fn);
     bun_set(ctx, global, "nativeGreet", 11, greet_fn);
@@ -383,7 +386,7 @@ int main(void)
     counter->value = 10;
 
     BunValue counter_obj = bun_object(ctx);
-    BunValue inc_fn = bun_function(ctx, "inc", counter_inc, NULL, 0);
+    BunValue inc_fn = bun_function(ctx, BUN_LITERAL("inc"), counter_inc, NULL, 0);
     bun_set_opaque(ctx, counter_obj, counter);
     bun_define_finalizer(ctx, counter_obj, counter_finalize, counter);
     bun_set(ctx, counter_obj, "inc", 3, inc_fn);
@@ -431,9 +434,9 @@ int main(void)
 
     printf("\n--- embed eval return-value regression ---\n");
     {
-        BunValue add_result = bun_eval_string(ctx, "(1+1)");
+        BunValue add_result = bun_eval_string(ctx, BUN_LITERAL("(1+1)"));
         if (add_result == BUN_EXCEPTION) {
-            fprintf(stderr, "[FAIL] bun_eval_string('(1+1)') threw: %s\n", bun_last_error(ctx));
+            fprintf(stderr, "[FAIL] bun_eval_string('(1+1)') threw: %s\n", bun_last_error(ctx, NULL));
         } else {
             double number = bun_to_number(ctx, add_result);
             if (number == 2.0) {
@@ -445,9 +448,9 @@ int main(void)
     }
 
     {
-        BunValue str_result = bun_eval_string(ctx, "(String(1+1))");
+        BunValue str_result = bun_eval_string(ctx, BUN_LITERAL("(String(1+1))"));
         if (str_result == BUN_EXCEPTION) {
-            fprintf(stderr, "[FAIL] bun_eval_string('(String(1+1))') threw: %s\n", bun_last_error(ctx));
+            fprintf(stderr, "[FAIL] bun_eval_string('(String(1+1))') threw: %s\n", bun_last_error(ctx, NULL));
         } else {
             size_t str_len = 0;
             char* str = bun_to_utf8(ctx, str_result, &str_len);
@@ -461,9 +464,9 @@ int main(void)
     }
 
     {
-        BunValue obj_result = bun_eval_string(ctx, "({ answer: 42 })");
+        BunValue obj_result = bun_eval_string(ctx, BUN_LITERAL("({ answer: 42 })"));
         if (obj_result == BUN_EXCEPTION) {
-            fprintf(stderr, "[FAIL] bun_eval_string('({ answer: 42 })') threw: %s\n", bun_last_error(ctx));
+            fprintf(stderr, "[FAIL] bun_eval_string('({ answer: 42 })') threw: %s\n", bun_last_error(ctx, NULL));
         } else if (!bun_is_object(obj_result)) {
             fprintf(stderr, "[FAIL] bun_eval_string('({ answer: 42 })') did not return an object\n");
         } else {
@@ -482,11 +485,11 @@ int main(void)
     }
 
     {
-        BunValue syntax_result = bun_eval_string(ctx, "const x =");
+        BunValue syntax_result = bun_eval_string(ctx, BUN_LITERAL("const x ="));
         if (syntax_result != BUN_EXCEPTION) {
             fprintf(stderr, "[FAIL] bun_eval_string('const x =') unexpectedly succeeded\n");
         } else {
-            const char* err = bun_last_error(ctx);
+            const char* err = bun_last_error(ctx, NULL);
             if (err && strstr(err, "SyntaxError") != NULL) {
                 printf("[PASS] bun_eval_string(syntax error) -> BUN_EXCEPTION\n");
             } else {
@@ -495,10 +498,10 @@ int main(void)
         }
     }
 
-#define EVAL(code)                                               \
-    do {                                                         \
-        if (bun_eval_string(ctx, (code)) == BUN_EXCEPTION)       \
-            fprintf(stderr, "Error: %s\n", bun_last_error(ctx)); \
+#define EVAL(code)                                                     \
+    do {                                                               \
+        if (bun_eval_string(ctx, BUN_CSTR(code)) == BUN_EXCEPTION)     \
+            fprintf(stderr, "Error: %s\n", bun_last_error(ctx, NULL)); \
     } while (0)
 
     EVAL("console.log('Hello from embedded Bun!')");
@@ -535,11 +538,11 @@ int main(void)
         "console.log('view proto === Object.getPrototypeOf(TextProto):', ViewProto === Object.getPrototypeOf(TextProto));");
 
     // Demonstrate bun_call with error detection.
-    if (bun_eval_string(ctx, "globalThis.throwingFn = () => { throw new Error('boom'); };") != BUN_EXCEPTION) {
+    if (bun_eval_string(ctx, BUN_LITERAL("globalThis.throwingFn = () => { throw new Error('boom'); };")) != BUN_EXCEPTION) {
         BunValue throwing_fn = bun_get(ctx, global, "throwingFn", 10);
         BunValue result = bun_call(ctx, throwing_fn, BUN_UNDEFINED, 0, NULL);
         if (result == BUN_EXCEPTION) {
-            const char* err = bun_last_error(ctx);
+            const char* err = bun_last_error(ctx, NULL);
             printf("bun_call caught exception: %s\n", err ? err : "(no message)");
         }
     }
@@ -549,17 +552,18 @@ int main(void)
     printf("\n--- embed exception formatting regression ---\n");
     if (bun_eval_string(
             ctx,
-            "globalThis.__embed_to_primitive_called = false;"
-            "const thrown = {"
-            "  marker: 'embed-non-error-throw',"
-            "  [Symbol.toPrimitive]() {"
-            "    globalThis.__embed_to_primitive_called = true;"
-            "    return 'coerced';"
-            "  }"
-            "};"
-            "throw thrown;")
+            BUN_LITERAL(
+                "globalThis.__embed_to_primitive_called = false;"
+                "const thrown = {"
+                "  marker: 'embed-non-error-throw',"
+                "  [Symbol.toPrimitive]() {"
+                "    globalThis.__embed_to_primitive_called = true;"
+                "    return 'coerced';"
+                "  }"
+                "};"
+                "throw thrown;"))
         == BUN_EXCEPTION) {
-        const char* err = bun_last_error(ctx);
+        const char* err = bun_last_error(ctx, NULL);
         printf("bun_eval_string non-Error throw: %s\n", err ? err : "(no message)");
 
         if (err && strstr(err, "No default value") != NULL) {
@@ -592,15 +596,15 @@ int main(void)
                     if (wrote < 0 || (size_t)wrote != strlen(module_src)) {
                         fprintf(stderr, "[FAIL] writing eval_file success module failed\n");
                     } else {
-                        BunValue eval_file_ok = bun_eval_file(eval_file_ctx, tmp_path);
+                        BunValue eval_file_ok = bun_eval_file(eval_file_ctx, BUN_CSTR(tmp_path));
                         if (eval_file_ok == BUN_EXCEPTION) {
-                            fprintf(stderr, "[FAIL] bun_eval_file(success) threw: %s\n", bun_last_error(eval_file_ctx));
+                            fprintf(stderr, "[FAIL] bun_eval_file(success) threw: %s\n", bun_last_error(eval_file_ctx, NULL));
                         } else if (eval_file_ok != BUN_UNDEFINED) {
                             fprintf(stderr, "[FAIL] bun_eval_file(success) returned %llu (expected BUN_UNDEFINED)\n", (unsigned long long)eval_file_ok);
                         } else {
-                            BunValue ok_value = bun_eval_string(eval_file_ctx, "globalThis.__embed_eval_file_ok");
+                            BunValue ok_value = bun_eval_string(eval_file_ctx, BUN_LITERAL("globalThis.__embed_eval_file_ok"));
                             if (ok_value == BUN_EXCEPTION) {
-                                fprintf(stderr, "[FAIL] reading __embed_eval_file_ok threw: %s\n", bun_last_error(eval_file_ctx));
+                                fprintf(stderr, "[FAIL] reading __embed_eval_file_ok threw: %s\n", bun_last_error(eval_file_ctx, NULL));
                             } else {
                                 double n = bun_to_number(eval_file_ctx, ok_value);
                                 if (n == 42.0) {
@@ -638,15 +642,15 @@ int main(void)
                     if (wrote < 0 || (size_t)wrote != strlen(module_src)) {
                         fprintf(stderr, "[FAIL] writing eval_file top-level await module failed\n");
                     } else {
-                        BunValue eval_file_await = bun_eval_file(eval_file_ctx, tmp_path);
+                        BunValue eval_file_await = bun_eval_file(eval_file_ctx, BUN_CSTR(tmp_path));
                         if (eval_file_await == BUN_EXCEPTION) {
-                            fprintf(stderr, "[FAIL] bun_eval_file(top-level await) threw: %s\n", bun_last_error(eval_file_ctx));
+                            fprintf(stderr, "[FAIL] bun_eval_file(top-level await) threw: %s\n", bun_last_error(eval_file_ctx, NULL));
                         } else if (eval_file_await != BUN_UNDEFINED) {
                             fprintf(stderr, "[FAIL] bun_eval_file(top-level await) returned %llu (expected BUN_UNDEFINED)\n", (unsigned long long)eval_file_await);
                         } else {
-                            BunValue awaited = bun_eval_string(eval_file_ctx, "globalThis.__embed_eval_file_await");
+                            BunValue awaited = bun_eval_string(eval_file_ctx, BUN_LITERAL("globalThis.__embed_eval_file_await"));
                             if (awaited == BUN_EXCEPTION) {
-                                fprintf(stderr, "[FAIL] reading __embed_eval_file_await threw: %s\n", bun_last_error(eval_file_ctx));
+                                fprintf(stderr, "[FAIL] reading __embed_eval_file_await threw: %s\n", bun_last_error(eval_file_ctx, NULL));
                             } else {
                                 double n = bun_to_number(eval_file_ctx, awaited);
                                 if (n == 42.0) {
@@ -675,12 +679,13 @@ int main(void)
                 snprintf(tmp_path, sizeof(tmp_path), "/tmp/bun-embed-missing-%ld.mjs", (long)getpid());
                 unlink(tmp_path);
 
-                BunValue missing = bun_eval_file(eval_file_ctx, tmp_path);
+                BunValue missing = bun_eval_file(eval_file_ctx, BUN_CSTR(tmp_path));
                 if (missing != BUN_EXCEPTION) {
                     fprintf(stderr, "[FAIL] bun_eval_file(missing file) unexpectedly succeeded\n");
                 } else {
-                    const char* err = bun_last_error(eval_file_ctx);
-                    if (err && err[0] != '\0') {
+                    size_t err_len = 0;
+                    const char* err = bun_last_error(eval_file_ctx, &err_len);
+                    if (err && err_len > 0) {
                         printf("[PASS] bun_eval_file(missing file) -> BUN_EXCEPTION\n");
                     } else {
                         fprintf(stderr, "[FAIL] bun_eval_file(missing file) did not provide an error message\n");
@@ -710,11 +715,11 @@ int main(void)
                     if (wrote < 0 || (size_t)wrote != strlen(module_src)) {
                         fprintf(stderr, "[FAIL] writing eval_file syntax-error module failed\n");
                     } else {
-                        BunValue eval_file_syntax = bun_eval_file(eval_file_ctx, tmp_path);
+                        BunValue eval_file_syntax = bun_eval_file(eval_file_ctx, BUN_CSTR(tmp_path));
                         if (eval_file_syntax != BUN_EXCEPTION) {
                             fprintf(stderr, "[FAIL] bun_eval_file(syntax error) unexpectedly succeeded\n");
                         } else {
-                            const char* err = bun_last_error(eval_file_ctx);
+                            const char* err = bun_last_error(eval_file_ctx, NULL);
                             if (err && (strstr(err, "SyntaxError") != NULL || strstr(err, "Unexpected") != NULL || strstr(err, "BuildMessage") != NULL)) {
                                 printf("[PASS] bun_eval_file(syntax error) -> readable error text\n");
                             } else {
@@ -749,11 +754,11 @@ int main(void)
                     if (wrote < 0 || (size_t)wrote != strlen(module_src)) {
                         fprintf(stderr, "[FAIL] writing eval_file throw module failed\n");
                     } else {
-                        BunValue eval_file_throw = bun_eval_file(eval_file_ctx, tmp_path);
+                        BunValue eval_file_throw = bun_eval_file(eval_file_ctx, BUN_CSTR(tmp_path));
                         if (eval_file_throw != BUN_EXCEPTION) {
                             fprintf(stderr, "[FAIL] bun_eval_file(throw) unexpectedly succeeded\n");
                         } else {
-                            const char* err = bun_last_error(eval_file_ctx);
+                            const char* err = bun_last_error(eval_file_ctx, NULL);
                             if (err && strstr(err, "No default value") != NULL) {
                                 fprintf(stderr, "[FAIL] bun_eval_file error regressed to TypeError: No default value\n");
                             } else {
