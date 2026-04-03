@@ -60,11 +60,9 @@ jobs:
             lib: libbun.dylib
             archive: libbun-macos-arm64.tar.gz
 
-          - name: macos-x64
-            os: macos-13
-            artifact: libbun-macos-x64
-            lib: libbun.dylib
-            archive: libbun-macos-x64.tar.gz
+          # macos-x64 (Intel) is omitted: GitHub Actions retired all macos-13
+          # runners in late 2024, and the bun build system does not support
+          # C++ cross-compilation from arm64 to x86_64.
 
           - name: linux-x64
             os: ubuntu-24.04
@@ -283,7 +281,6 @@ jobs:
           | File | Platform |
           |------|----------|
           | `libbun-macos-arm64.tar.gz` | macOS arm64 (Apple Silicon) |
-          | `libbun-macos-x64.tar.gz`   | macOS x64 (Intel) |
           | `libbun-linux-x64.tar.gz`   | Linux x86_64 (glibc) |
           | `libbun-linux-aarch64.tar.gz` | Linux aarch64 (glibc) |
           | `libbun-windows-x64.zip`    | Windows x64 |
@@ -307,7 +304,6 @@ jobs:
             --title "libbun (embed @ ${SHA7})" \
             --notes-file /tmp/release-notes.md \
             "artifacts/libbun-macos-arm64/libbun-macos-arm64.tar.gz" \
-            "artifacts/libbun-macos-x64/libbun-macos-x64.tar.gz" \
             "artifacts/libbun-linux-x64/libbun-linux-x64.tar.gz" \
             "artifacts/libbun-linux-aarch64/libbun-linux-aarch64.tar.gz" \
             "artifacts/libbun-windows-x64/libbun-windows-x64.zip"
