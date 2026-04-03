@@ -88,8 +88,32 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Bun
+      # The internal setup-bun action uses `ln -fs` with ${{ runner.temp }}
+      # in a bash shell.  On Windows, runner.temp expands to a backslash path
+      # (e.g. D:\a\_temp); bash treats \a and \_ as escape sequences, which
+      # corrupts the path.  Run the action only on Unix; handle Windows below.
+      - name: Setup Bun (Unix)
+        if: runner.os != 'Windows'
         uses: ./.github/actions/setup-bun
+
+      - name: Setup Bun (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = "https://pub-5e11e972747a44bf9aaf9394f185a982.r2.dev/releases/latest/bun-windows-x64.zip"
+          $zip  = "$env:RUNNER_TEMP\bun-windows-x64.zip"
+          $out  = "$env:RUNNER_TEMP\bun-extract"
+          $bin  = "$env:RUNNER_TEMP\.bun\bin"
+          Write-Host "Downloading bun for Windows..."
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          Expand-Archive -Path $zip -DestinationPath $out -Force
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          Move-Item "$out\bun-windows-x64\bun.exe" "$bin\bun.exe" -Force
+          # bunx is just a copy of bun on Windows (no symlink needed)
+          Copy-Item "$bin\bun.exe" "$bin\bunx.exe" -Force
+          Add-Content $env:GITHUB_PATH $bin
+          Write-Host "bun installed to $bin"
 
       # ── macOS: LLVM 21 via Homebrew ──────────────────────
       - name: Install LLVM 21 + build tools (macOS)
@@ -164,17 +188,11 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-libbun-v1-
 
       # ── Build ─────────────────────────────────────────────
-      # --ci enables CI-specific build flags:
-      #   - LTO enabled by default on Linux release builds
-      #   - macOS deployment target pinned to 13.0 (reproducible across runners)
       # --shared-lib=on  →  builds libbun.{dylib,so,dll} instead of an executable
+      # GitHub Actions sets CI=true automatically; the build script detects this
+      # for collapsible log groups.  No explicit --ci flag: it is not a CLI arg.
       - name: Build libbun (release)
-        run: |
-          bun scripts/build.ts \
-            --profile=release \
-            --shared-lib=on \
-            --build-dir=build/shared-release \
-            --ci
+        run: bun scripts/build.ts --profile=release --shared-lib=on --build-dir=build/shared-release
 
       # ── Package ───────────────────────────────────────────
       - name: Package artifact (Unix)
