@@ -141,7 +141,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = "21.1.0"
+          $version = "21.1.8"
           $installer = "$env:RUNNER_TEMP\LLVM-${version}-win64.exe"
           Write-Host "Downloading LLVM ${version} for Windows..."
           Invoke-WebRequest `
@@ -154,18 +154,24 @@ jobs:
           Add-Content $env:GITHUB_PATH "C:\Program Files\LLVM\bin"
           Write-Host "LLVM installed to C:\Program Files\LLVM\bin"
 
-      # ── Windows: fix PATH so system tar.exe wins over Git's MSYS2 tar ──
-      # Git for Windows ships MSYS2's tar.exe (C:\Program Files\Git\usr\bin\tar.exe),
-      # which appears earlier in PATH than C:\Windows\System32\tar.exe.
-      # MSYS2's tar doesn't understand Windows drive letters — it treats "D:" as a
-      # network hostname and fails with "Cannot connect to D: resolve failed" when
-      # extracting archives to paths like D:\a\...
-      # Writing to GITHUB_PATH *prepends* the directory for all subsequent steps,
-      # so the real BSD tar.exe in System32 takes precedence.
-      - name: Fix PATH order on Windows (system tar before Git MSYS2 tar)
+      # ── Windows: remove MSYS2 tar so system tar.exe is used ────────────
+      # Git for Windows ships MSYS2's tar.exe at C:\Program Files\Git\usr\bin\tar.exe.
+      # That tar doesn't understand Windows drive letters and fails with
+      # "Cannot connect to D: resolve failed" when extracting archives to D:\a\...
+      # Deleting it (rather than prepending System32 to PATH) avoids the side-effect
+      # of making C:\Windows\System32\bash.EXE (WSL stub) take priority over Git Bash,
+      # which would break subsequent steps that use the default bash shell.
+      - name: Fix tar on Windows (remove MSYS2 tar, use system tar)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Add-Content $env:GITHUB_PATH "C:\Windows\System32"
+        run: |
+          $msys2Tar = "C:\Program Files\Git\usr\bin\tar.exe"
+          if (Test-Path $msys2Tar) {
+            Remove-Item $msys2Tar -Force
+            Write-Host "Removed MSYS2 tar: $msys2Tar"
+          } else {
+            Write-Host "MSYS2 tar not found at expected location, skipping."
+          }
 
       # ── Dependency cache ──────────────────────────────────
       # Cached paths:
