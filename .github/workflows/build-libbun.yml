@@ -67,13 +67,13 @@ jobs:
             archive: libbun-macos-x64.tar.gz
 
           - name: linux-x64
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             artifact: libbun-linux-x64
             lib: libbun.so
             archive: libbun-linux-x64.tar.gz
 
           - name: linux-aarch64
-            os: ubuntu-22.04-arm
+            os: ubuntu-24.04-arm
             artifact: libbun-linux-aarch64
             lib: libbun.so
             archive: libbun-linux-aarch64.tar.gz
@@ -153,6 +153,19 @@ jobs:
           Remove-Item $installer -Force -ErrorAction SilentlyContinue
           Add-Content $env:GITHUB_PATH "C:\Program Files\LLVM\bin"
           Write-Host "LLVM installed to C:\Program Files\LLVM\bin"
+
+      # ── Windows: fix PATH so system tar.exe wins over Git's MSYS2 tar ──
+      # Git for Windows ships MSYS2's tar.exe (C:\Program Files\Git\usr\bin\tar.exe),
+      # which appears earlier in PATH than C:\Windows\System32\tar.exe.
+      # MSYS2's tar doesn't understand Windows drive letters — it treats "D:" as a
+      # network hostname and fails with "Cannot connect to D: resolve failed" when
+      # extracting archives to paths like D:\a\...
+      # Writing to GITHUB_PATH *prepends* the directory for all subsequent steps,
+      # so the real BSD tar.exe in System32 takes precedence.
+      - name: Fix PATH order on Windows (system tar before Git MSYS2 tar)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "C:\Windows\System32"
 
       # ── Dependency cache ──────────────────────────────────
       # Cached paths:
