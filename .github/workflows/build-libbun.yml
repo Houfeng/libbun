@@ -1,0 +1,276 @@
+# Build libbun — shared library (libbun.dylib / libbun.so / libbun.dll)
+#
+# Triggered by changes to the `embed` branch.  Builds release-mode shared
+# libraries for macOS arm64, macOS x64, Linux x86_64, Linux aarch64, and
+# Windows x64, then publishes them as GitHub Actions artifacts and creates
+# a tagged GitHub Release.
+#
+# Toolchain requirements (per bun's build system):
+#   - LLVM 21.1.x  (clang/clang++/lld)
+#   - CMake
+#   - Ninja
+#   - Perl  (LUT codegen via create-hash-table.ts)
+#   - Rust / cargo  (for lol-html, a Rust dep)
+#   - Zig  (auto-downloaded to vendor/zig/ by the build script)
+#   - WebKit prebuilt  (auto-downloaded to build/shared-release/cache/ by the
+#     build script from oven-sh/WebKit public GitHub releases)
+#
+# On cache hit the dependency compile step is skipped; only bun's own Zig +
+# C/C++ sources need to be compiled.  First-run cold builds take 1–2 hours
+# per platform.
+
+name: Build libbun
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - embed
+  pull_request:
+    branches:
+      - embed
+  workflow_dispatch:
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # Build jobs — one per target platform, all run in parallel
+  # ──────────────────────────────────────────────────────────
+  build:
+    name: Build libbun (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+
+    permissions:
+      contents: read
+
+    defaults:
+      run:
+        shell: bash
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-14
+            artifact: libbun-macos-arm64
+            lib: libbun.dylib
+            archive: libbun-macos-arm64.tar.gz
+
+          - name: macos-x64
+            os: macos-13
+            artifact: libbun-macos-x64
+            lib: libbun.dylib
+            archive: libbun-macos-x64.tar.gz
+
+          - name: linux-x64
+            os: ubuntu-22.04
+            artifact: libbun-linux-x64
+            lib: libbun.so
+            archive: libbun-linux-x64.tar.gz
+
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm
+            artifact: libbun-linux-aarch64
+            lib: libbun.so
+            archive: libbun-linux-aarch64.tar.gz
+
+          - name: windows-x64
+            os: windows-2022
+            artifact: libbun-windows-x64
+            lib: libbun.dll
+            archive: libbun-windows-x64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      # ── macOS: LLVM 21 via Homebrew ──────────────────────
+      - name: Install LLVM 21 + build tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm@21 cmake ninja
+          echo "$(brew --prefix llvm@21)/bin" >> "$GITHUB_PATH"
+
+      # ── Linux: LLVM 21 via apt.llvm.org ──────────────────
+      - name: Install LLVM 21 + build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21
+          sudo apt-get install -y cmake ninja-build perl
+          # Add versioned bin dir to PATH so the build script's tool discovery
+          # finds clang-21, lld-21, etc. directly (it also searches this path).
+          echo "/usr/lib/llvm-21/bin" >> "$GITHUB_PATH"
+
+      # ── Windows: LLVM 21 from LLVM GitHub releases ───────
+      # cmake and ninja are pre-installed on windows-2022.
+      # Strawberry Perl is pre-installed at C:\Strawberry\perl\bin.
+      - name: Install LLVM 21 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "21.1.0"
+          $installer = "$env:RUNNER_TEMP\LLVM-${version}-win64.exe"
+          Write-Host "Downloading LLVM ${version} for Windows..."
+          Invoke-WebRequest `
+            -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-${version}/LLVM-${version}-win64.exe" `
+            -OutFile $installer `
+            -UseBasicParsing
+          Write-Host "Installing LLVM ${version} silently..."
+          Start-Process -FilePath $installer -ArgumentList "/S" -Wait
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+          Add-Content $env:GITHUB_PATH "C:\Program Files\LLVM\bin"
+          Write-Host "LLVM installed to C:\Program Files\LLVM\bin"
+
+      # ── Dependency cache ──────────────────────────────────
+      # Cached paths:
+      #   vendor/             — C/C++ dependency source trees (fetched by ninja
+      #                         from GitHub archives, ~300–500 MB)
+      #   vendor/zig/         — Zig compiler binary (~100 MB), also a subpath of
+      #                         vendor/ so covered above
+      #   build/shared-release/cache/
+      #                       — WebKit prebuilt tarball + other source archives
+      #                         (~600 MB). The build script downloads these from
+      #                         public GitHub releases; caching avoids re-downloads.
+      #   build/shared-release/deps/
+      #                       — Compiled static libraries (.a/.lib) for all
+      #                         C/C++ deps (boringssl, brotli, etc.).  This is
+      #                         the biggest time saver — these take 30–60 min to
+      #                         compile from scratch.
+      #   ~/.cargo/           — Rust crate registry + git checkouts for lol-html.
+      #
+      # Cache key: hash of all dep-version-pin files (scripts/build/deps/**/*.ts,
+      # zig.ts) + rust-toolchain.toml.  Any dependency version bump invalidates
+      # the cache and forces a fresh build.
+      - name: Cache build dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            vendor
+            build/shared-release/cache
+            build/shared-release/deps
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-libbun-v1-${{ hashFiles('scripts/build/deps/**/*.ts', 'scripts/build/zig.ts', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-libbun-v1-
+
+      # ── Build ─────────────────────────────────────────────
+      # --ci enables CI-specific build flags:
+      #   - LTO enabled by default on Linux release builds
+      #   - macOS deployment target pinned to 13.0 (reproducible across runners)
+      # --shared-lib=on  →  builds libbun.{dylib,so,dll} instead of an executable
+      - name: Build libbun (release)
+        run: |
+          bun scripts/build.ts \
+            --profile=release \
+            --shared-lib=on \
+            --build-dir=build/shared-release \
+            --ci
+
+      # ── Package ───────────────────────────────────────────
+      - name: Package artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp "build/shared-release/${{ matrix.lib }}" dist/
+          cp src/embed/bun_embed.h dist/
+          tar -czf "${{ matrix.archive }}" -C dist .
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p dist
+          cp "build/shared-release/${{ matrix.lib }}" dist/
+          cp src/embed/bun_embed.h dist/
+
+      - name: Compress artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive }}"
+
+      # ── Upload ────────────────────────────────────────────
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.archive }}
+          retention-days: 30
+
+  # ──────────────────────────────────────────────────────────
+  # Release job — runs after all build jobs succeed,
+  # only on push to embed or manual workflow_dispatch
+  # (not on pull_request events).
+  # ──────────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Write release notes
+        run: |
+          SHA7="${GITHUB_SHA::7}"
+          cat > /tmp/release-notes.md << 'EOF'
+          Auto-built `libbun` from the `embed` branch.
+
+          ## Contents
+
+          Each archive contains:
+          - The shared library: `libbun.dylib` / `libbun.so` / `libbun.dll`
+          - The public C header: `bun_embed.h`
+
+          ## Platforms
+
+          | File | Platform |
+          |------|----------|
+          | `libbun-macos-arm64.tar.gz` | macOS arm64 (Apple Silicon) |
+          | `libbun-macos-x64.tar.gz`   | macOS x64 (Intel) |
+          | `libbun-linux-x64.tar.gz`   | Linux x86_64 (glibc) |
+          | `libbun-linux-aarch64.tar.gz` | Linux aarch64 (glibc) |
+          | `libbun-windows-x64.zip`    | Windows x64 |
+
+          ## Usage
+
+          Link against the library and include `bun_embed.h`.  See
+          `src/embed/example.c` in the repository for an example.
+          EOF
+          echo "" >> /tmp/release-notes.md
+          echo "**Commit**: [\`${SHA7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})" >> /tmp/release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA7="${GITHUB_SHA::7}"
+          TAG="embed-libbun-${SHA7}"
+
+          gh release create "${TAG}" \
+            --title "libbun (embed @ ${SHA7})" \
+            --notes-file /tmp/release-notes.md \
+            "artifacts/libbun-macos-arm64/libbun-macos-arm64.tar.gz" \
+            "artifacts/libbun-macos-x64/libbun-macos-x64.tar.gz" \
+            "artifacts/libbun-linux-x64/libbun-linux-x64.tar.gz" \
+            "artifacts/libbun-linux-aarch64/libbun-linux-aarch64.tar.gz" \
+            "artifacts/libbun-windows-x64/libbun-windows-x64.zip"
