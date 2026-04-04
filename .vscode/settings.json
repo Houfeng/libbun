@@ -159,5 +159,5 @@
   "git.detectSubmodules": false,
   "bun.test.customScript": "./build/debug/bun-debug test",
   "zig.libPath": "${workspaceFolder}/vendor/zig/lib",
-  "cSpell.words": ["Finalizer"],
+  "cSpell.words": ["boringssl", "Finalizer", "libbun", "NASM"],
 }
