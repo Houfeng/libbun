@@ -229,7 +229,9 @@ jobs:
           if [ -f vendor/WebKit/CMakeLists.txt ]; then
             echo "WebKit already present at vendor/WebKit/ (cache hit)."
           else
-            commit=$(bun -e "import { WEBKIT_VERSION } from './scripts/build/deps/webkit.ts'; process.stdout.write(WEBKIT_VERSION)")
+            # Extract the commit hash directly from the source file to avoid
+            # importing the build system (which has circular-init issues).
+            commit=$(grep -oP '(?<=WEBKIT_VERSION = ")([0-9a-f]+)(?=")' scripts/build/deps/webkit.ts)
             echo "Cloning oven-sh/WebKit at ${commit}..."
             git init vendor/WebKit
             git -C vendor/WebKit remote add origin https://github.com/oven-sh/WebKit
