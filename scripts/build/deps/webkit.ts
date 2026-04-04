@@ -211,6 +211,16 @@ export const webkit: Dependency = {
 
     const spec: NestedCmakeBuild = { kind: "nested-cmake", targets: ["jsc"], args };
 
+    // When building a shared library (.so / .dylib), all objects that end up
+    // in the final link must be position-independent.  The prebuilt WebKit
+    // tarballs are NOT compiled with -fPIC (they use TLS Local Exec on x86-64,
+    // which the linker rejects under -shared).  For local builds we can pass
+    // -DCMAKE_POSITION_INDEPENDENT_CODE=ON so that bmalloc, WTF, and JSC are
+    // all compiled with -fPIC, making them safe to link into a shared library.
+    if (cfg.sharedLib) {
+      spec.pic = true;
+    }
+
     if (cfg.windows) {
       const icu = icuDir(cfg);
       const srcDir = depSourceDir(cfg, "WebKit");

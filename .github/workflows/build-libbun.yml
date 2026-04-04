@@ -59,22 +59,30 @@ jobs:
             artifact: libbun-macos-arm64
             lib: libbun.dylib
             archive: libbun-macos-arm64.tar.gz
+            webkit: prebuilt
 
           # macos-x64 (Intel) is omitted: GitHub Actions retired all macos-13
           # runners in late 2024, and the bun build system does not support
           # C++ cross-compilation from arm64 to x86_64.
 
+          # linux-x64: the WebKit prebuilt is not compiled with -fPIC, so we
+          # build WebKit from the oven-sh/WebKit source (webkit: local).  This
+          # triggers -DCMAKE_POSITION_INDEPENDENT_CODE=ON so that bmalloc, WTF
+          # and JSC are compiled with -fPIC and can safely link into libbun.so.
+          # The source is cloned to vendor/WebKit/ and cached across runs.
           - name: linux-x64
             os: ubuntu-24.04
             artifact: libbun-linux-x64
             lib: libbun.so
             archive: libbun-linux-x64.tar.gz
+            webkit: local
 
           - name: windows-x64
             os: windows-2022
             artifact: libbun-windows-x64
             lib: libbun.dll
             archive: libbun-windows-x64.zip
+            webkit: prebuilt
 
     steps:
       - name: Checkout
@@ -121,7 +129,10 @@ jobs:
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 21
-          sudo apt-get install -y cmake ninja-build perl
+          # libicu-dev: headers + libs for WebKit's local build (JSCOnly port
+          #   uses system ICU on Linux; prebuilt bundles its own).
+          # ruby: WebKit cmake generates DerivedSources via ruby scripts.
+          sudo apt-get install -y cmake ninja-build perl libicu-dev ruby
           # Add versioned bin dir to PATH so the build script's tool discovery
           # finds clang-21, lld-21, etc. directly (it also searches this path).
           echo "/usr/lib/llvm-21/bin" >> "$GITHUB_PATH"
@@ -207,12 +218,45 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-libbun-v1-
 
+      # ── Clone WebKit source (Linux local mode) ──────────
+      # The WebKit prebuilt is not PIC-safe for -shared; on Linux we build
+      # from source with CMAKE_POSITION_INDEPENDENT_CODE=ON.  The clone is
+      # stored in vendor/WebKit/ which is covered by the cache above, so
+      # subsequent runs skip the git fetch entirely.
+      - name: Clone WebKit source (Linux local mode)
+        if: matrix.webkit == 'local'
+        run: |
+          if [ -f vendor/WebKit/CMakeLists.txt ]; then
+            echo "WebKit already present at vendor/WebKit/ (cache hit)."
+          else
+            commit=$(bun -e "import { WEBKIT_VERSION } from './scripts/build/deps/webkit.ts'; process.stdout.write(WEBKIT_VERSION)")
+            echo "Cloning oven-sh/WebKit at ${commit}..."
+            git init vendor/WebKit
+            git -C vendor/WebKit remote add origin https://github.com/oven-sh/WebKit
+            git -C vendor/WebKit fetch --depth=1 origin "$commit"
+            git -C vendor/WebKit checkout FETCH_HEAD
+            echo "WebKit cloned."
+          fi
+
       # ── Build ─────────────────────────────────────────────
       # --shared-lib=on  →  builds libbun.{dylib,so,dll} instead of an executable
+      # --webkit=...     →  prebuilt (default) or local (Linux: built from source
+      #                     with -fPIC so bmalloc/WTF/JSC are PIC-safe for -shared)
       # GitHub Actions sets CI=true automatically; the build script detects this
       # for collapsible log groups.  No explicit --ci flag: it is not a CLI arg.
-      - name: Build libbun (release)
-        run: bun scripts/build.ts --profile=release --shared-lib=on --build-dir=build/shared-release
+      - name: Build libbun (release, Unix)
+        if: runner.os != 'Windows'
+        run: bun scripts/build.ts --profile=release --shared-lib=on --build-dir=build/shared-release --webkit=${{ matrix.webkit }}
+
+      # Windows: wrap in vs-shell.ps1 so that INCLUDE/LIB are set before
+      # ninja runs llvm-rc (which needs windows.h) and clang-cl/lld-link
+      # (which need the MSVC CRT headers and libraries).  This matches the
+      # pattern used by the Buildkite CI for regular bun Windows builds.
+      - name: Build libbun (release, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "scripts\vs-shell.ps1" bun scripts/build.ts --profile=release --shared-lib=on --build-dir=build/shared-release
 
       # ── Package ───────────────────────────────────────────
       - name: Package artifact (Unix)

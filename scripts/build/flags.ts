@@ -416,6 +416,11 @@ export const bunOnlyFlags: Flag[] = [
     when: c => c.unix && !c.sharedLib,
     desc: "No position-independent code (we're a final executable, not a shared library)",
   },
+  {
+    flag: "-fPIC",
+    when: c => c.unix && c.sharedLib,
+    desc: "Position-independent code required for a shared library (.so / .dylib)",
+  },
 
   // ─── Warnings-as-errors (unix) ───
   {
