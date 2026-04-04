@@ -70,12 +70,6 @@ jobs:
             lib: libbun.so
             archive: libbun-linux-x64.tar.gz
 
-          - name: linux-aarch64
-            os: ubuntu-24.04-arm
-            artifact: libbun-linux-aarch64
-            lib: libbun.so
-            archive: libbun-linux-aarch64.tar.gz
-
           - name: windows-x64
             os: windows-2022
             artifact: libbun-windows-x64
@@ -132,10 +126,12 @@ jobs:
           # finds clang-21, lld-21, etc. directly (it also searches this path).
           echo "/usr/lib/llvm-21/bin" >> "$GITHUB_PATH"
 
-      # ── Windows: LLVM 21 from LLVM GitHub releases ───────
+      # ── Windows: LLVM 21 + NASM ──────────────────────────
       # cmake and ninja are pre-installed on windows-2022.
       # Strawberry Perl is pre-installed at C:\Strawberry\perl\bin.
-      - name: Install LLVM 21 (Windows)
+      # NASM is NOT pre-installed; boringssl requires it on Windows x64
+      # for enable_language(ASM_NASM). Install it via Chocolatey.
+      - name: Install LLVM 21 + NASM (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -151,6 +147,13 @@ jobs:
           Remove-Item $installer -Force -ErrorAction SilentlyContinue
           Add-Content $env:GITHUB_PATH "C:\Program Files\LLVM\bin"
           Write-Host "LLVM installed to C:\Program Files\LLVM\bin"
+          # NASM is required by boringssl's cmake on Windows x64
+          # (enable_language(ASM_NASM) in boringssl CMakeLists.txt).
+          # It is not pre-installed on windows-2022 runner images.
+          Write-Host "Installing NASM via Chocolatey..."
+          choco install nasm -y --no-progress
+          Add-Content $env:GITHUB_PATH "C:\Program Files\NASM"
+          Write-Host "NASM installed to C:\Program Files\NASM"
 
       # ── Windows: remove MSYS2 tar so system tar.exe is used ────────────
       # Git for Windows ships MSYS2's tar.exe at C:\Program Files\Git\usr\bin\tar.exe.
@@ -282,7 +285,6 @@ jobs:
           |------|----------|
           | `libbun-macos-arm64.tar.gz` | macOS arm64 (Apple Silicon) |
           | `libbun-linux-x64.tar.gz`   | Linux x86_64 (glibc) |
-          | `libbun-linux-aarch64.tar.gz` | Linux aarch64 (glibc) |
           | `libbun-windows-x64.zip`    | Windows x64 |
 
           ## Usage
@@ -305,5 +307,4 @@ jobs:
             --notes-file /tmp/release-notes.md \
             "artifacts/libbun-macos-arm64/libbun-macos-arm64.tar.gz" \
             "artifacts/libbun-linux-x64/libbun-linux-x64.tar.gz" \
-            "artifacts/libbun-linux-aarch64/libbun-linux-aarch64.tar.gz" \
             "artifacts/libbun-windows-x64/libbun-windows-x64.zip"

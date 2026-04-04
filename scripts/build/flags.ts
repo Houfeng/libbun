@@ -413,8 +413,8 @@ export const bunOnlyFlags: Flag[] = [
   },
   {
     flag: ["-fno-pic", "-fno-pie"],
-    when: c => c.unix,
-    desc: "No position-independent code (we're a final executable)",
+    when: c => c.unix && !c.sharedLib,
+    desc: "No position-independent code (we're a final executable, not a shared library)",
   },
 
   // ─── Warnings-as-errors (unix) ───
