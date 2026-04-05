@@ -182,17 +182,19 @@ export const webkit: Dependency = {
 
     // Local: nested cmake, target=jsc.
     //
-    // CMAKE_C_FLAGS/CMAKE_CXX_FLAGS set to empty: clears the global dep
-    // flags source.ts would otherwise pass. WebKit's cmake sets its own
-    // -O/-march/etc.; ours would conflict. Dep args go LAST so they override.
-    //
-    // Windows: ICU built from source via preBuild before cmake configure.
-    // WebKit's cmake finds it via ICU_ROOT. On posix, system ICU is used
-    // (macOS: Homebrew headers + system libs; Linux: libicu-dev) — cmake
-    // auto-detects.
+    // CMAKE_C_FLAGS/CMAKE_CXX_FLAGS set here instead of via the global dep
+    // flags in source.ts (which WebKit's cmake would conflict with — it sets
+    // its own -O/-march/etc.).  When building a shared library we must include
+    // -fPIC so that bmalloc/WTF/JSC are compiled position-independently.
+    // This value is pushed LAST by source.ts's dep-args loop and therefore
+    // overrides source.ts's own -DCMAKE_C_FLAGS= line; we must carry -fPIC
+    // here rather than relying solely on CMAKE_POSITION_INDEPENDENT_CODE
+    // because WebKit's nested cmake structure does not always propagate that
+    // cache variable into bmalloc's per-object compilation.
+    const picFlag = cfg.sharedLib && !cfg.windows ? "-fPIC" : "";
     const args: Record<string, string> = {
-      CMAKE_C_FLAGS: "",
-      CMAKE_CXX_FLAGS: "",
+      CMAKE_C_FLAGS: picFlag,
+      CMAKE_CXX_FLAGS: picFlag,
       PORT: "JSCOnly",
       ENABLE_STATIC_JSC: "ON",
       USE_THIN_ARCHIVES: "OFF",
