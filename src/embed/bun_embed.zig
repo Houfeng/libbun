@@ -793,9 +793,13 @@ const TickContext = struct {
         // Non-blocking tick: process ready tasks + microtasks
         vm.eventLoop().tick();
 
-        // Also do a non-blocking I/O poll (kqueue/epoll with zero timeout)
+        // Also do a non-blocking I/O poll (kqueue/epoll on POSIX, IOCP via libuv on Windows)
         if (vm.event_loop_handle) |loop| {
-            loop.tickWithoutIdle();
+            if (comptime Environment.isPosix) {
+                loop.tickWithoutIdle(); // us_loop_run_bun_tick with zero timeout
+            } else {
+                loop.tickWithTimeout(0); // uv_run(UV_RUN_NOWAIT)
+            }
         }
 
         // Process any tasks that became ready from I/O
@@ -875,7 +879,7 @@ pub export fn bun_global(ctx: ?*BunContext) callconv(.c) BunValue {
     return toBunValue(global.toJSValue());
 }
 
-fn hostFnTrampoline(global: *JSGlobalObject, callframe: *jsc.CallFrame) callconv(.c) JSValue {
+fn hostFnTrampoline(global: *JSGlobalObject, callframe: *jsc.CallFrame) callconv(jsc.conv) JSValue {
     const callee = callframe.callee();
     // Look up in the runtime's per-instance registry via the VM pointer.
     // We find the runtime by casting the VM's globalObject back: the VM is
