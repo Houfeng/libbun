@@ -623,6 +623,9 @@ const EvalContext = struct {
     result: BunValue,
 
     pub fn run(this: *EvalContext) void {
+        // Lazily start the inspector thread on first eval (idempotent).
+        this.runtime.vm.ensureDebugger(false) catch {};
+
         var exception: JSValue = .js_undefined;
         const ret = Bun__REPL__evaluate(
             this.global,
