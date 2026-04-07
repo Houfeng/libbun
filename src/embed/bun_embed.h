@@ -176,8 +176,12 @@ typedef struct {
     const char* cwd;
     /// Debugger startup mode. Zero / BUN_DEBUGGER_OFF disables debugging.
     BunDebuggerMode debugger_mode;
-    /// Optional inspector listen URL or path (for example tcp://127.0.0.1:6499
-    /// or unix:///tmp/bun-debug.sock). Pass NULL to use Bun's default.
+    /// Optional inspector listen URL or path. Pass NULL to use Bun's default.
+    /// Examples:
+    ///   "6499"                        — listen on ws://localhost:6499/<random>
+    ///   "127.0.0.1:6499"              — listen on a specific interface
+    ///   "ws://0.0.0.0:6499/debug"     — listen with a fixed WebSocket path
+    ///   "unix:///tmp/bun-debug.sock"  — listen on a Unix socket
     const char* debugger_listen_url;
 } BunInitializeOptions;
 
