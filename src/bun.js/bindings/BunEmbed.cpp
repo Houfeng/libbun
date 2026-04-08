@@ -304,6 +304,7 @@ class JSBunClassInstance final : public JSDestructibleObject {
 public:
     using Base = JSDestructibleObject;
     static constexpr unsigned StructureFlags = Base::StructureFlags;
+    static constexpr DestructionMode needsDestruction = NeedsDestruction;
 
     static JSBunClassInstance* create(
         VM& vm,
@@ -328,12 +329,10 @@ public:
         static_cast<JSBunClassInstance*>(cell)->~JSBunClassInstance();
     }
 
-    template<typename, JSC::SubspaceAccess mode>
-    static GCClient::IsoSubspace* subspaceFor(VM& vm)
+    template<typename CellType, JSC::SubspaceAccess>
+    static CompleteSubspace* subspaceFor(VM& vm)
     {
-        if constexpr (mode == SubspaceAccess::Concurrently)
-            return nullptr;
-        return &vm.plainObjectSpace();
+        return &vm.destructibleObjectSpace();
     }
 
     DECLARE_INFO;
