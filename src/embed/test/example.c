@@ -1,7 +1,7 @@
 /// example.c — Demonstrates the zero-copy BunValue embedding API.
 ///
 /// Build (assuming bun is built as a shared library):
-///   cc -o example example.c -L<bun-lib-dir> -lbun -I.
+///   cc -o example example.c -L<bun-lib-dir> -lbun -I..
 ///
 /// This file is for illustration only and is NOT compiled as part of Bun.
 
@@ -10,7 +10,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include "bun_embed.h"
+#include "../bun_embed.h"
 
 #define BUN_LITERAL(str) (str), sizeof(str) - 1
 #define BUN_CSTR(str) (str), strlen(str)

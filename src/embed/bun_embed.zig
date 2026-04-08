@@ -707,6 +707,17 @@ const EvalFileContext = struct {
     pub fn run(this: *EvalFileContext) void {
         const vm = this.runtime.vm;
 
+        // Clear any previously loaded entry point from the module registry so
+        // that bun_eval_file can be called more than once on the same runtime.
+        vm.clearEntryPoint() catch {
+            if (this.global.tryTakeException()) |exc| {
+                this.runtime.captureException(this.global, exc);
+            } else {
+                this.runtime.setLastErrorBytes("failed to clear previous entry point");
+            }
+            return;
+        };
+
         const promise = vm.loadEntryPoint(this.path) catch {
             if (this.global.tryTakeException()) |exc| {
                 this.runtime.captureException(this.global, exc);
