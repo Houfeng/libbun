@@ -470,6 +470,61 @@ int main(void)
     }
 
     /* ------------------------------------------------------------------ */
+    /* Test 7: finalizer 必须被 GC 调用                                   */
+    /*                                                                      */
+    /* 验证 JSBunClassInstance 使用了正确的 subspace：                     */
+    /*   - 正确版本 (destructibleObjectSpace)：GC sweep 时调用 destroy()   */
+    /*     → BunClassFinalizerFn 被触发，g_vec2_finalized 增加             */
+    /*   - 错误版本 (plainObjectSpace / cellHeapCellType)：GC sweep 不调   */
+    /*     用 destroy()，finalizer 永不被触发 → 内存泄漏                   */
+    /* ------------------------------------------------------------------ */
+    printf("\n--- Test 7: GC must invoke class finalizer (subspace correctness) ---\n");
+    {
+        BunRuntime* rt = bun_initialize(NULL);
+        BunContext* ctx = bun_context(rt);
+        BunValue global = bun_global(ctx);
+
+        BunClass* vec2_class = bun_class_register(ctx, &VEC2_CLASS, NULL);
+        bun_set(ctx, global, "Vec2", 4, bun_class_constructor(ctx, vec2_class));
+
+        g_vec2_finalized = 0; /* 重置计数器 */
+
+        /* 在 eval_file 中批量创建实例，不持有引用，让 GC 可以回收 */
+        char tmp[128];
+        snprintf(tmp, sizeof(tmp), "/tmp/bun-ecfc-t7-%ld.mjs", (long)getpid());
+        const char* src = "for (let i = 0; i < 200; i++) { new Vec2(i, i); }\n"
+                          "globalThis.__t7_done = true;\n";
+
+        int module_ok = write_tmp_module(tmp, src) && bun_eval_file(ctx, BUN_CSTR(tmp)) != BUN_EXCEPTION;
+        unlink(tmp);
+
+        if (!module_ok) {
+            FAIL("eval_file for test 7 failed: %s", bun_last_error(ctx, NULL));
+        } else {
+            /* 强制同步 GC，让所有不可达实例被回收 */
+            bun_eval_string(ctx, BUN_LITERAL("Bun.gc(true)"));
+
+            /* 让事件循环处理 GC 后续的 finalizer 队列 */
+            for (int i = 0; i < 10 && bun_run_pending_jobs(rt); i++) {
+            }
+
+            if (g_vec2_finalized > 0) {
+                printf("[PASS] GC invoked finalizer %d time(s) — subspace is correct\n",
+                    g_vec2_finalized);
+                passed++;
+            } else {
+                fprintf(stderr,
+                    "[FAIL] finalizer never called after Bun.gc(true): "
+                    "JSBunClassInstance likely uses wrong subspace "
+                    "(plainObjectSpace/cellHeapCellType does not call destroy())\n");
+                failed++;
+            }
+        }
+
+        bun_destroy(rt);
+    }
+
+    /* ------------------------------------------------------------------ */
 summary:
     printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
     return failed > 0 ? 1 : 0;

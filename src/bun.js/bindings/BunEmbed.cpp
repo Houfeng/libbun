@@ -202,9 +202,12 @@ public:
     DECLARE_INFO;
 
     template<typename CellType, JSC::SubspaceAccess>
-    static JSC::GCClient::IsoSubspace* subspaceFor(JSC::VM& vm)
+    static JSC::CompleteSubspace* subspaceFor(JSC::VM& vm)
     {
-        return &vm.internalFunctionSpace();
+        // JSBunClassConstructor adds m_registeredClass (8 bytes) beyond InternalFunction,
+        // so it cannot use internalFunctionSpace() which is an IsoSubspace sized for
+        // sizeof(InternalFunction). Use cellSpace (CompleteSubspace, variable cell size).
+        return &vm.heap.cellSpace;
     }
 
     static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* globalObject, JSC::JSValue prototype)
