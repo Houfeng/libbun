@@ -614,25 +614,6 @@ static bool isVMCompatible(JSGlobalObject* globalObject, BunEmbedRegisteredClass
     return registeredClass && registeredClass->vm == &globalObject->vm();
 }
 
-struct AccessorKey {
-    uintptr_t object_ptr;
-    std::string name;
-
-    bool operator==(const AccessorKey& other) const
-    {
-        return object_ptr == other.object_ptr && name == other.name;
-    }
-};
-
-struct AccessorKeyHash {
-    size_t operator()(const AccessorKey& key) const
-    {
-        const size_t h1 = std::hash<uintptr_t> {}(key.object_ptr);
-        const size_t h2 = std::hash<std::string> {}(key.name);
-        return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
-    }
-};
-
 struct AccessorEntry {
     BunEmbedGetterFn getter { nullptr };
     void* getter_userdata { nullptr };
@@ -645,35 +626,32 @@ enum BunEmbedAccessorUpdateMask : uint8_t {
     BunEmbedAccessorUpdateSetter = 1 << 1,
 };
 
-static std::unordered_map<AccessorKey, AccessorEntry, AccessorKeyHash> s_accessor_map;
+// Two-level map: object_ptr → (property_name → accessor_entry).
+// Using a 2-level structure allows O(1) cleanup of all entries for a given
+// object inside a GC finalizer, preventing stale entries from being matched
+// when the GC reuses the same cell address for a new object.
+static std::unordered_map<uintptr_t, std::unordered_map<std::string, AccessorEntry>> s_accessor_map;
 static std::mutex s_accessor_map_mutex;
-
-static AccessorKey makeKey(EncodedJSValue thisValue, PropertyName propertyName)
-{
-    JSValue decoded = JSValue::decode(thisValue);
-    auto* object = decoded.getObject();
-
-    ZigString zig_name = Zig::toZigString(propertyName.publicName());
-    std::string name;
-    if (zig_name.ptr && zig_name.len > 0) {
-        name.assign(reinterpret_cast<const char*>(zig_name.ptr), zig_name.len);
-    }
-
-    return AccessorKey {
-        .object_ptr = reinterpret_cast<uintptr_t>(object),
-        .name = std::move(name),
-    };
-}
 
 JSC_DEFINE_CUSTOM_GETTER(BunEmbed_customGetter, (JSGlobalObject * globalObject, EncodedJSValue thisValue, PropertyName propertyName))
 {
+    auto* object = JSValue::decode(thisValue).getObject();
+    if (!object)
+        return JSValue::encode(jsUndefined());
+
+    ZigString zig_name = Zig::toZigString(propertyName.publicName());
+    std::string name(reinterpret_cast<const char*>(zig_name.ptr), zig_name.len);
+
     AccessorEntry entry {};
     {
         std::lock_guard<std::mutex> lock(s_accessor_map_mutex);
-        auto it = s_accessor_map.find(makeKey(thisValue, propertyName));
-        if (it == s_accessor_map.end() || !it->second.getter)
+        auto outerIt = s_accessor_map.find(reinterpret_cast<uintptr_t>(object));
+        if (outerIt == s_accessor_map.end())
             return JSValue::encode(jsUndefined());
-        entry = it->second;
+        auto innerIt = outerIt->second.find(name);
+        if (innerIt == outerIt->second.end() || !innerIt->second.getter)
+            return JSValue::encode(jsUndefined());
+        entry = innerIt->second;
     }
 
     return static_cast<EncodedJSValue>(entry.getter(static_cast<void*>(globalObject), static_cast<uint64_t>(thisValue), entry.getter_userdata));
@@ -681,13 +659,23 @@ JSC_DEFINE_CUSTOM_GETTER(BunEmbed_customGetter, (JSGlobalObject * globalObject, 
 
 JSC_DEFINE_CUSTOM_SETTER(BunEmbed_customSetter, (JSGlobalObject * globalObject, EncodedJSValue thisValue, EncodedJSValue value, PropertyName propertyName))
 {
+    auto* object = JSValue::decode(thisValue).getObject();
+    if (!object)
+        return false;
+
+    ZigString zig_name = Zig::toZigString(propertyName.publicName());
+    std::string name(reinterpret_cast<const char*>(zig_name.ptr), zig_name.len);
+
     AccessorEntry entry {};
     {
         std::lock_guard<std::mutex> lock(s_accessor_map_mutex);
-        auto it = s_accessor_map.find(makeKey(thisValue, propertyName));
-        if (it == s_accessor_map.end() || !it->second.setter)
+        auto outerIt = s_accessor_map.find(reinterpret_cast<uintptr_t>(object));
+        if (outerIt == s_accessor_map.end())
             return false;
-        entry = it->second;
+        auto innerIt = outerIt->second.find(name);
+        if (innerIt == outerIt->second.end() || !innerIt->second.setter)
+            return false;
+        entry = innerIt->second;
     }
 
     entry.setter(static_cast<void*>(globalObject), static_cast<uint64_t>(thisValue), static_cast<uint64_t>(value), entry.setter_userdata);
@@ -718,18 +706,17 @@ extern "C" bool BunEmbed__defineCustomAccessor(
     if (!object)
         return false;
 
-    AccessorEntry entry {};
+    VM& vm = globalObject->vm();
+    uintptr_t ptr = reinterpret_cast<uintptr_t>(object);
+    std::string nameStr(keyPtr, keyLen);
+    bool isFirstAccessorForObject = false;
+
     {
         std::lock_guard<std::mutex> lock(s_accessor_map_mutex);
-        AccessorKey key {
-            .object_ptr = reinterpret_cast<uintptr_t>(object),
-            .name = std::string(keyPtr, keyLen),
-        };
+        auto& outer = s_accessor_map[ptr];
+        isFirstAccessorForObject = outer.empty();
 
-        if (auto it = s_accessor_map.find(key); it != s_accessor_map.end()) {
-            entry = it->second;
-        }
-
+        auto& entry = outer[nameStr];
         if (updateMask & BunEmbedAccessorUpdateGetter) {
             entry.getter = getter;
             entry.getter_userdata = getterUserdata;
@@ -739,19 +726,43 @@ extern "C" bool BunEmbed__defineCustomAccessor(
             entry.setter_userdata = setterUserdata;
         }
 
-        if (!entry.getter && !entry.setter)
+        if (!entry.getter && !entry.setter) {
+            outer.erase(nameStr);
+            if (outer.empty())
+                s_accessor_map.erase(ptr);
             return false;
-
-        s_accessor_map[key] = entry;
+        }
     }
 
-    VM& vm = globalObject->vm();
+    // Register a GC finalizer the first time we add an accessor to this object.
+    // When the object is collected the finalizer removes all its entries from
+    // s_accessor_map in O(1), preventing stale entries from being matched if
+    // the GC reuses the same cell address for a new object.
+    if (isFirstAccessorForObject) {
+        vm.heap.addFinalizer(object, [ptr](JSCell*) {
+            std::lock_guard<std::mutex> lock(s_accessor_map_mutex);
+            s_accessor_map.erase(ptr);
+        });
+    }
+
     WTF::String keyString = WTF::String::fromUTF8(std::span { keyPtr, keyLen });
     if (keyString.isNull())
         return false;
 
+    // Re-read the final entry to determine if a setter is present, so we can
+    // correctly configure the CustomGetterSetter and ReadOnly attribute.
+    bool has_setter = false;
+    {
+        std::lock_guard<std::mutex> lock(s_accessor_map_mutex);
+        auto outerIt = s_accessor_map.find(ptr);
+        if (outerIt != s_accessor_map.end()) {
+            auto innerIt = outerIt->second.find(nameStr);
+            if (innerIt != outerIt->second.end())
+                has_setter = (innerIt->second.setter != nullptr);
+        }
+    }
+
     unsigned attributes = 0;
-    const bool has_setter = entry.setter != nullptr;
     const bool auto_read_only = (updateMask == BunEmbedAccessorUpdateGetter) && !has_setter;
     if ((flags & (1u << 0)) || auto_read_only)
         attributes |= PropertyAttribute::ReadOnly;

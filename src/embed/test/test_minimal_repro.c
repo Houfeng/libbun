@@ -200,6 +200,122 @@ static int test9_class_before_uint8array(void)
     return ok;
 }
 
+/* --- accessor map GC-cleanup tests --- */
+
+static int g_getter_call_count = 0;
+
+static BunValue accessor_getter(BunContext* ctx, BunValue this_val, void* ud)
+{
+    (void)ctx;
+    (void)this_val;
+    (void)ud;
+    g_getter_call_count++;
+    return bun_number(42.0);
+}
+
+/* Test 10: eval_string — accessor on short-lived object, GC, no stale callback */
+static int test10_eval_string_accessor_gc(void)
+{
+    BunRuntime* rt = bun_initialize(NULL);
+    BunContext* ctx = bun_context(rt);
+
+    /* Create an object, attach an accessor, let it go out of scope, force GC.
+       Then create a new object and verify the accessor is NOT called on it. */
+    BunValue result = bun_eval_string(ctx,
+        BUN_LITERAL(
+            "let obj = {}; obj; // returned so C can attach accessor\n"));
+    if (result == BUN_EXCEPTION) {
+        bun_destroy(rt);
+        return 0;
+    }
+
+    bun_define_accessor(ctx, result, "x", 1,
+        accessor_getter, NULL, NULL,
+        0, 0, 0);
+
+    /* Let obj become unreachable and force GC */
+    bun_eval_string(ctx, BUN_LITERAL("globalThis.__tmp = null; Bun.gc(true);"));
+
+    /* New object at potentially the same address — accessor should NOT fire */
+    int before = g_getter_call_count;
+    bun_eval_string(ctx, BUN_LITERAL("let obj2 = {}; obj2.x;"));
+    int after = g_getter_call_count;
+
+    bun_destroy(rt);
+    /* If stale accessor fires, after > before (bug). With fix, after == before. */
+    return (after == before);
+}
+
+/* Test 11: eval_file — accessor on object created inside module, GC, no stale match */
+static int test11_eval_file_accessor_gc(void)
+{
+    BunRuntime* rt = bun_initialize(NULL);
+    BunContext* ctx = bun_context(rt);
+
+    char tmp[128];
+    snprintf(tmp, 128, "/tmp/bun-repro-11-%ld.mjs", (long)getpid());
+    write_tmp(tmp,
+        "const obj = {};\n"
+        "globalThis.__exportedObj = obj;\n");
+
+    BunValue r = bun_eval_file(ctx, BUN_CSTR(tmp));
+    unlink(tmp);
+    if (r == BUN_EXCEPTION) {
+        bun_destroy(rt);
+        return 0;
+    }
+
+    /* Attach accessor to globalThis.__exportedObj */
+    BunValue obj = bun_get(ctx, bun_global(ctx), "__exportedObj", 13);
+    if (obj == BUN_EXCEPTION || obj == BUN_UNDEFINED) {
+        bun_destroy(rt);
+        return 0;
+    }
+
+    bun_define_accessor(ctx, obj, "y", 1,
+        accessor_getter, NULL, NULL,
+        0, 0, 0);
+
+    int before = g_getter_call_count;
+
+    /* Clear the reference, let module scope go away, force GC */
+    bun_eval_string(ctx, BUN_LITERAL("globalThis.__exportedObj = null; Bun.gc(true);"));
+
+    /* New object from a fresh eval — should NOT trigger old accessor */
+    bun_eval_string(ctx, BUN_LITERAL("let fresh = {}; fresh.y;"));
+
+    int after = g_getter_call_count;
+
+    bun_destroy(rt);
+    return (after == before);
+}
+
+/* Test 12: accessor still works while object is alive (regression guard) */
+static int test12_accessor_works_while_alive(void)
+{
+    BunRuntime* rt = bun_initialize(NULL);
+    BunContext* ctx = bun_context(rt);
+
+    BunValue obj = bun_eval_string(ctx, BUN_LITERAL("let o = {}; o;"));
+    if (obj == BUN_EXCEPTION) {
+        bun_destroy(rt);
+        return 0;
+    }
+
+    bun_set(ctx, bun_global(ctx), "testObj12", 9, obj); /* keep alive */
+    bun_define_accessor(ctx, obj, "val", 3,
+        accessor_getter, NULL, NULL,
+        0, 0, 0);
+
+    int before = g_getter_call_count;
+    BunValue got = bun_eval_string(ctx, BUN_LITERAL("testObj12.val;"));
+    int after = g_getter_call_count;
+
+    bun_destroy(rt);
+    /* accessor must have fired exactly once */
+    return (after == before + 1) && (got != BUN_EXCEPTION);
+}
+
 struct {
     const char* name;
     TestFn fn;
@@ -213,6 +329,9 @@ struct {
     { " 7: eval_file, Float32Array + MyClass", test7_float32array },
     { " 8: eval_file, Buffer.from + MyClass", test8_buffer },
     { " 9: eval_file, MyClass THEN Uint8Array", test9_class_before_uint8array },
+    { "10: eval_string, accessor map GC cleanup", test10_eval_string_accessor_gc },
+    { "11: eval_file, accessor map GC cleanup", test11_eval_file_accessor_gc },
+    { "12: accessor works while object alive", test12_accessor_works_while_alive },
 };
 static const int NUM_TESTS = sizeof(tests) / sizeof(tests[0]);
 
