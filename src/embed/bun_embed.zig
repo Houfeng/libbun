@@ -943,12 +943,13 @@ fn watcherThread(runtime: *BunRuntime) void {
 
         while (!runtime.event_watcher_stop.load(.acquire)) {
             // uv_backend_timeout: 0=work ready now, N>0=ms to next timer, -1=no timers.
-            // Compute a deadline for IOCP blocking so timers fire on time.
+            // Use the exact libuv deadline so timeout-based wakeups only happen
+            // when work is actually due, instead of every fixed polling interval.
             const timeout_raw = uv.uv_backend_timeout(loop);
             const timeout_ms: w.DWORD = if (timeout_raw == 0)
                 0 // Work is already ready; return instantly from IOCP call.
-            else if (timeout_raw < 0 or timeout_raw > 500)
-                500 // No active timer or very far future; cap to avoid INFINITE hang.
+            else if (timeout_raw < 0)
+                w.INFINITE // No timers pending; wait for real I/O or uv_async wakeup.
             else
                 @intCast(timeout_raw);
 
@@ -957,7 +958,7 @@ fn watcherThread(runtime: *BunRuntime) void {
             // completion (via uv_async_send → PostQueuedCompletionStatus).
             var entries: [64]w.OVERLAPPED_ENTRY = undefined;
             var n: w.ULONG = 0;
-            _ = w.kernel32.GetQueuedCompletionStatusEx(
+            const rc = w.kernel32.GetQueuedCompletionStatusEx(
                 loop.iocp,
                 &entries,
                 64,
@@ -978,6 +979,17 @@ fn watcherThread(runtime: *BunRuntime) void {
                     );
                 }
                 break;
+            }
+
+            const should_notify = if (rc != 0)
+                true
+            else switch (w.kernel32.GetLastError()) {
+                .TIMEOUT, .WAIT_TIMEOUT => timeout_raw >= 0,
+                else => false,
+            };
+
+            if (!should_notify) {
+                continue;
             }
 
             // Re-enqueue every packet we dequeued so libuv processes them
