@@ -330,6 +330,7 @@ BUN_1.2 {
   bun_run_pending_jobs;
   bun_get_event_fd;
   bun_wakeup;
+  bun_set_event_callback;
   bun_bool;
   bun_number;
   bun_int32;

@@ -124,6 +124,22 @@ const PendingCall = struct {
     argv: []BunValue,
 };
 
+// ---------------------------------------------------------------------------
+// Windows-only Win32 helpers for the event watcher background thread.
+// Declared here (rather than via std.os.windows.kernel32) because SetEvent
+// and CreateEventW are not all exposed by Zig's standard library.
+// ---------------------------------------------------------------------------
+const win32 = if (Environment.isWindows) struct {
+    const w = std.os.windows;
+    extern "kernel32" fn CreateEventW(
+        lpEventAttributes: ?*anyopaque,
+        bManualReset: w.BOOL,
+        bInitialState: w.BOOL,
+        lpName: ?w.LPCWSTR,
+    ) callconv(.winapi) ?w.HANDLE;
+    extern "kernel32" fn SetEvent(hEvent: w.HANDLE) callconv(.winapi) w.BOOL;
+} else void;
+
 /// Opaque runtime handle exposed to C as `BunRuntime*`.
 const BunRuntime = struct {
     vm: *VirtualMachine,
@@ -139,6 +155,23 @@ const BunRuntime = struct {
     opaque_map: OpaqueMap = .{},
     /// Runtime-local class handles allocated by BunEmbed.cpp.
     class_registry: std.ArrayListUnmanaged(*BunClass) = .{},
+
+    // -----------------------------------------------------------------------
+    // Event-watcher fields (populated by bun_set_event_callback)
+    // -----------------------------------------------------------------------
+
+    /// Host callback invoked from the background watcher thread when the JS
+    /// event loop transitions from idle to having ready work.
+    event_callback_fn: ?*const fn (?*anyopaque) callconv(.c) void = null,
+    event_callback_userdata: ?*anyopaque = null,
+    /// Background thread that monitors the platform event fd / timer deadline.
+    event_watcher_thread: ?std.Thread = null,
+    /// Set to true to ask the watcher thread to exit.
+    event_watcher_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Windows only: auto-reset Win32 event that wakes the watcher thread early
+    /// (e.g. when bun_wakeup() is called from another thread).
+    event_watcher_win_handle: if (Environment.isWindows) ?std.os.windows.HANDLE else void =
+        if (Environment.isWindows) null else {},
 
     fn setLastErrorBytes(runtime: *BunRuntime, bytes: []const u8) void {
         const err_str = bun.default_allocator.allocSentinel(u8, bytes.len, 0) catch return;
@@ -576,6 +609,7 @@ fn initializeImpl(options: ?*const BunInitializeOptions) !?*BunRuntime {
 
 pub export fn bun_destroy(rt: ?*BunRuntime) callconv(.c) void {
     const runtime = rt orelse return;
+    stopEventWatcher(runtime);
     unregisterRuntime(runtime);
     runtime.freeLastError();
     runtime.freePendingCalls();
@@ -764,6 +798,13 @@ pub export fn bun_run_pending_jobs(rt: ?*BunRuntime) callconv(.c) c_int {
     const runtime = rt orelse return 0;
     var tick_ctx = TickContext{ .runtime = runtime, .has_pending = false };
     runtime.vm.runWithAPILock(TickContext, &tick_ctx, TickContext.run);
+    // Windows: signal the watcher thread that we have finished processing so
+    // it can safely resumes its GetQueuedCompletionStatusEx blocking loop.
+    // The ACK prevents the watcher from immediately re-dequeuing the packets
+    // it just re-enqueued before libuv has had a chance to consume them.
+    if (comptime Environment.isWindows) {
+        if (runtime.event_watcher_win_handle) |h| _ = win32.SetEvent(h);
+    }
     return if (tick_ctx.has_pending) 1 else 0;
 }
 
@@ -823,6 +864,12 @@ const TickContext = struct {
     }
 };
 
+// Returns the underlying kqueue/epoll fd on POSIX so the host can monitor it
+// directly (e.g. via poll/select, CFFileDescriptor, or a GSource) and call
+// bun_run_pending_jobs() when it becomes readable.
+// Returns -1 on Windows (IOCP has no pollable fd) or if unavailable.
+// Cross-platform alternative: bun_set_event_callback() works on all
+// platforms including Windows without requiring manual fd polling.
 pub export fn bun_get_event_fd(rt: ?*BunRuntime) callconv(.c) c_int {
     const runtime = rt orelse return -1;
     if (comptime Environment.isPosix) {
@@ -836,8 +883,191 @@ pub export fn bun_get_event_fd(rt: ?*BunRuntime) callconv(.c) c_int {
 pub export fn bun_wakeup(rt: ?*BunRuntime) callconv(.c) void {
     const runtime = rt orelse return;
     if (runtime.vm.event_loop_handle) |loop| {
+        // On POSIX: wakes the kqueue/epoll fd → watcherThread's poll() returns.
+        // On Windows: uv_async_send posts a synthetic completion to loop.iocp →
+        //             watcherThread's GetQueuedCompletionStatusEx returns immediately.
+        // Note: bun_call_async() already calls loop.wakeup() internally after
+        // enqueuing the call, so there is no need to call bun_wakeup() after
+        // bun_call_async().
         loop.wakeup();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Event watcher — background thread + bun_set_event_callback
+// ---------------------------------------------------------------------------
+
+/// Background thread that monitors the platform event fd (POSIX) or libuv's
+/// IOCP handle (Windows), and invokes the user's callback whenever the JS
+/// event loop has ready work.
+///
+/// POSIX: blocks in poll() on the kqueue/epoll fd — wake is instant for all
+/// event types (I/O, timers, cross-thread via loop.wakeup()).
+///
+/// Windows (IOCP dequeue-requeue):
+///   1. Block in GetQueuedCompletionStatusEx(loop.iocp, …) — this is a TRUE
+///      blocking wait: TCP data arrives → IOCP completes → returns in 0 µs.
+///      Timers use uv_backend_timeout() as the deadline so they are exact.
+///      bun_wakeup() calls uv_async_send() which posts a synthetic completion
+///      to the same IOCP → also wakes immediately.
+///   2. Re-enqueue dequeued packets so libuv can process them later.
+///   3. Fire user callback → host calls SDL_PushEvent (or equivalent).
+///   4. Wait on ACK event until bun_run_pending_jobs() has run, preventing
+///      the background thread from re-stealing packets before libuv sees them.
+fn watcherThread(runtime: *BunRuntime) void {
+    if (comptime Environment.isPosix) {
+        const loop = runtime.vm.event_loop_handle orelse return;
+        const fd: i32 = loop.fd;
+        while (!runtime.event_watcher_stop.load(.acquire)) {
+            var pfd = [1]std.posix.pollfd{.{
+                .fd = fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            // 200 ms timeout: lets us check the stop flag even if no events arrive.
+            const n = std.posix.poll(&pfd, 200) catch 0;
+            if (n > 0 and !runtime.event_watcher_stop.load(.acquire)) {
+                if (runtime.event_callback_fn) |cb| {
+                    cb(runtime.event_callback_userdata);
+                }
+            }
+        }
+    } else {
+        // Windows: true IOCP blocking — zero CPU, zero I/O latency.
+        const uv = bun.windows.libuv;
+        const w = std.os.windows;
+        const loop = runtime.vm.event_loop_handle orelse return;
+        // event_watcher_win_handle is the ACK event (auto-reset), signaled by
+        // bun_run_pending_jobs() after each tick so we don't re-steal packets.
+        const ack_event = runtime.event_watcher_win_handle orelse return;
+
+        while (!runtime.event_watcher_stop.load(.acquire)) {
+            // uv_backend_timeout: 0=work ready now, N>0=ms to next timer, -1=no timers.
+            // Compute a deadline for IOCP blocking so timers fire on time.
+            const timeout_raw = uv.uv_backend_timeout(loop);
+            const timeout_ms: w.DWORD = if (timeout_raw == 0)
+                0 // Work is already ready; return instantly from IOCP call.
+            else if (timeout_raw < 0 or timeout_raw > 500)
+                500 // No active timer or very far future; cap to avoid INFINITE hang.
+            else
+                @intCast(timeout_raw);
+
+            // Block here until real I/O completes (IOCP), a timer deadline
+            // arrives (timeout_ms expiry), or bun_wakeup() posts a synthetic
+            // completion (via uv_async_send → PostQueuedCompletionStatus).
+            var entries: [64]w.OVERLAPPED_ENTRY = undefined;
+            var n: w.ULONG = 0;
+            _ = w.kernel32.GetQueuedCompletionStatusEx(
+                loop.iocp,
+                &entries,
+                64,
+                &n,
+                timeout_ms,
+                0, // fAlertable = FALSE
+            );
+
+            if (runtime.event_watcher_stop.load(.acquire)) {
+                // Re-enqueue any packets we just pulled so libuv can still
+                // see them during clean-up or the next bun_run_pending_jobs.
+                for (entries[0..n]) |entry| {
+                    _ = w.kernel32.PostQueuedCompletionStatus(
+                        loop.iocp,
+                        entry.dwNumberOfBytesTransferred,
+                        entry.lpCompletionKey,
+                        entry.lpOverlapped,
+                    );
+                }
+                break;
+            }
+
+            // Re-enqueue every packet we dequeued so libuv processes them
+            // normally when bun_run_pending_jobs() calls uv_run(NOWAIT).
+            for (entries[0..n]) |entry| {
+                _ = w.kernel32.PostQueuedCompletionStatus(
+                    loop.iocp,
+                    entry.dwNumberOfBytesTransferred,
+                    entry.lpCompletionKey,
+                    entry.lpOverlapped,
+                );
+            }
+
+            // Fire user callback — expected to do SDL_PushEvent or similar.
+            if (runtime.event_callback_fn) |cb| {
+                cb(runtime.event_callback_userdata);
+            }
+
+            // Wait for bun_run_pending_jobs() to finish before looping.
+            // This prevents us from immediately re-dequeuing the same packets
+            // with GetQueuedCompletionStatusEx before libuv has processed them.
+            _ = w.kernel32.WaitForSingleObject(ack_event, w.INFINITE);
+        }
+    }
+}
+
+/// Stop and join the event watcher thread if one is running.
+fn stopEventWatcher(runtime: *BunRuntime) void {
+    if (runtime.event_watcher_thread == null) return;
+
+    runtime.event_watcher_stop.store(true, .release);
+
+    if (comptime Environment.isWindows) {
+        // Wake the background thread from both possible blocking points:
+        //   a) GetQueuedCompletionStatusEx — post a synthetic wakeup via uv_async_send.
+        //   b) WaitForSingleObject(ack_event) — signal the ACK event directly.
+        if (runtime.vm.event_loop_handle) |loop| loop.wakeup();
+        if (runtime.event_watcher_win_handle) |h| _ = win32.SetEvent(h);
+    }
+
+    runtime.event_watcher_thread.?.join();
+    runtime.event_watcher_thread = null;
+    runtime.event_watcher_stop.store(false, .release);
+
+    if (comptime Environment.isWindows) {
+        if (runtime.event_watcher_win_handle) |h| {
+            std.os.windows.CloseHandle(h);
+            runtime.event_watcher_win_handle = null;
+        }
+    }
+}
+
+pub export fn bun_set_event_callback(
+    rt: ?*BunRuntime,
+    cb: ?*const fn (?*anyopaque) callconv(.c) void,
+    userdata: ?*anyopaque,
+) callconv(.c) void {
+    const runtime = rt orelse return;
+
+    // Stop any existing watcher before updating the callback.
+    stopEventWatcher(runtime);
+
+    runtime.event_callback_fn = cb;
+    runtime.event_callback_userdata = userdata;
+
+    if (cb == null) return;
+
+    // Prepare platform-specific resources before spawning the thread.
+    if (comptime Environment.isWindows) {
+        // Auto-reset event (bManualReset=FALSE), initially non-signaled.
+        const h = win32.CreateEventW(null, 0, 0, null);
+        if (h == null) return; // Win32 event creation failed; skip watcher.
+        runtime.event_watcher_win_handle = h;
+    }
+
+    runtime.event_watcher_stop.store(false, .release);
+    runtime.event_watcher_thread = std.Thread.spawn(
+        .{ .allocator = bun.default_allocator },
+        watcherThread,
+        .{runtime},
+    ) catch {
+        // Thread creation failed; release the Win32 event if we made one.
+        if (comptime Environment.isWindows) {
+            if (runtime.event_watcher_win_handle) |h| {
+                std.os.windows.CloseHandle(h);
+                runtime.event_watcher_win_handle = null;
+            }
+        }
+        return;
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1529,6 +1759,7 @@ comptime {
     _ = &bun_run_pending_jobs;
     _ = &bun_get_event_fd;
     _ = &bun_wakeup;
+    _ = &bun_set_event_callback;
     _ = &bun_bool;
     _ = &bun_number;
     _ = &bun_int32;
