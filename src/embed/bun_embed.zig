@@ -924,8 +924,9 @@ fn watcherThread(runtime: *BunRuntime) void {
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
-            // 200 ms timeout: lets us check the stop flag even if no events arrive.
-            const n = std.posix.poll(&pfd, 200) catch 0;
+            // Block until real loop activity arrives. stopEventWatcher() uses
+            // loop.wakeup() to break this wait immediately during shutdown.
+            const n = std.posix.poll(&pfd, std.math.maxInt(i32)) catch 0;
             if (n > 0 and !runtime.event_watcher_stop.load(.acquire)) {
                 if (runtime.event_callback_fn) |cb| {
                     cb(runtime.event_callback_userdata);
@@ -1022,11 +1023,11 @@ fn stopEventWatcher(runtime: *BunRuntime) void {
 
     runtime.event_watcher_stop.store(true, .release);
 
+    if (runtime.vm.event_loop_handle) |loop| loop.wakeup();
+
     if (comptime Environment.isWindows) {
-        // Wake the background thread from both possible blocking points:
-        //   a) GetQueuedCompletionStatusEx — post a synthetic wakeup via uv_async_send.
-        //   b) WaitForSingleObject(ack_event) — signal the ACK event directly.
-        if (runtime.vm.event_loop_handle) |loop| loop.wakeup();
+        // Wake the background thread's secondary blocking point:
+        // WaitForSingleObject(ack_event) — signal the ACK event directly.
         if (runtime.event_watcher_win_handle) |h| _ = win32.SetEvent(h);
     }
 

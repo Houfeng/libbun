@@ -290,8 +290,9 @@ typedef void (*BunEventCallback)(void* userdata);
 ///   macOS) via poll(). Zero CPU while idle. All event types — I/O, timers,
 ///   and cross-thread wakeups (bun_wakeup → loop.wakeup()) — are delivered
 ///   through the same fd, so the callback fires with near-zero latency when
-///   real work arrives. The internal 200ms poll timeout exists only so the
-///   watcher thread can notice callback replacement / shutdown while idle.
+///   real work arrives. The watcher does not use a periodic idle timeout;
+///   callback replacement / shutdown wakes the loop explicitly to break the
+///   blocking poll immediately.
 ///
 /// Windows (IOCP dequeue-requeue):
 ///   The thread blocks on libuv's internal IOCP handle via
