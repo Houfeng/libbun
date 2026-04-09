@@ -607,11 +607,13 @@ EXPORTS
   bun_is_number
   bun_is_string
   bun_is_object
+  bun_is_array
   bun_is_callable
   bun_to_bool
   bun_to_number
   bun_to_int32
   bun_to_utf8
+  bun_array_length
   bun_set
   bun_get
   bun_set_index

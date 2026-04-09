@@ -586,11 +586,13 @@ _bun_is_bool
 _bun_is_number
 _bun_is_string
 _bun_is_object
+_bun_is_array
 _bun_is_callable
 _bun_to_bool
 _bun_to_number
 _bun_to_int32
 _bun_to_utf8
+_bun_array_length
 _bun_set
 _bun_get
 _bun_set_index
