@@ -263,17 +263,21 @@ int bun_get_event_fd(BunRuntime* rt);
 /// call, so there is no need to follow bun_call_async() with bun_wakeup().
 void bun_wakeup(BunRuntime* rt);
 
-/// Callback invoked from a Bun-internal background thread when the JS event
-/// loop transitions from idle to having ready work. Use it to wake up your
-/// GUI framework's blocking event wait (e.g. SDL_PushEvent, PostMessage, …).
+/// Callback invoked from a Bun-internal background thread when the runtime has
+/// ready work and the host loop should be woken (e.g. SDL_PushEvent,
+/// PostMessage, …).
 ///
 /// THREAD SAFETY: Invoked from a background thread, NOT from the host's main
 /// thread. The callback must be thread-safe.
 ///
+/// Intended use: signal or wake the host loop, then call
+/// bun_run_pending_jobs() later from the runtime's owning thread.
+///
 /// @param userdata  The pointer passed to bun_set_event_callback().
 typedef void (*BunEventCallback)(void* userdata);
 
-/// Set the event-ready callback, replacing any previously set one.
+/// Set the event-ready callback used to wake the host loop, replacing any
+/// previously set one.
 ///
 /// Starts an internal background thread that monitors the event loop.
 /// Each call immediately stops the previous background thread (if any) and
@@ -285,20 +289,23 @@ typedef void (*BunEventCallback)(void* userdata);
 ///   The thread blocks on the kernel event fd (epoll on Linux, kqueue on
 ///   macOS) via poll(). Zero CPU while idle. All event types — I/O, timers,
 ///   and cross-thread wakeups (bun_wakeup → loop.wakeup()) — are delivered
-///   through the same fd, so the callback fires with zero latency.
+///   through the same fd, so the callback fires with near-zero latency when
+///   real work arrives. The internal 200ms poll timeout exists only so the
+///   watcher thread can notice callback replacement / shutdown while idle.
 ///
 /// Windows (IOCP dequeue-requeue):
 ///   The thread blocks on libuv's internal IOCP handle via
 ///   GetQueuedCompletionStatusEx(). This is a true OS-level blocking wait —
-///   zero CPU while idle. All event types reach IOCP with zero latency:
+///   zero CPU while idle. Work-ready conditions are detected as follows:
 ///     • Network / file I/O  → OS posts IOCP completion → immediate wake
 ///     • bun_wakeup()        → uv_async_send posts synthetic IOCP → immediate
 ///     • Timers              → uv_backend_timeout() used as IOCP deadline →
 ///                             exact to the millisecond
-///   After waking, the thread re-enqueues dequeued IOCP packets via
-///   PostQueuedCompletionStatus so libuv processes them normally, then fires
-///   the callback, and waits for bun_run_pending_jobs() to signal an ACK
-///   event before resuming the next blocking wait.
+///   Indefinite idle waits do NOT generate periodic callbacks. If the watcher
+///   dequeues IOCP packets, it re-enqueues them via PostQueuedCompletionStatus
+///   so libuv processes them normally, then fires the callback, and waits for
+///   bun_run_pending_jobs() to signal an ACK event before resuming the next
+///   blocking wait.
 ///
 /// @param rt        Runtime handle.
 /// @param cb        Callback invoked when work is ready (NULL to unregister).
@@ -605,6 +612,8 @@ const char* bun_last_error(BunContext* ctx, size_t* out_len);
 /// Queue a JavaScript function call to run on the context's owning runtime.
 ///
 /// The call is executed later when the host drives bun_run_pending_jobs().
+/// On success this also wakes the runtime's event loop automatically, so an
+/// additional bun_wakeup() call is usually unnecessary.
 /// Returns 1 if queued successfully, 0 on failure.
 int bun_call_async(BunContext* ctx, BunValue fn, BunValue this_value, int argc, const BunValue* argv);
 
