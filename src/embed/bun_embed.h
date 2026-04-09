@@ -424,6 +424,11 @@ int bun_is_bool(BunValue value);
 int bun_is_number(BunValue value);
 int bun_is_string(BunValue value);
 int bun_is_object(BunValue value);
+
+/// Return 1 when value is a JavaScript Array (including subclasses).
+/// TypedArrays (Uint8Array, Float32Array, etc.) are NOT arrays and return 0.
+/// Use bun_get_typed_array() to test for TypedArrays.
+int bun_is_array(BunValue value);
 int bun_is_callable(BunValue value);
 
 int bun_to_bool(BunValue value);
@@ -433,6 +438,14 @@ int32_t bun_to_int32(BunValue value);
 /// Returns a newly allocated UTF-8 string. Caller must free() the returned pointer.
 /// On failure, returns NULL.
 char* bun_to_utf8(BunContext* ctx, BunValue value, size_t* out_len);
+
+/// Get the "length" of any value that has a length-like property.
+///
+/// Works for Array, TypedArray (element count), String, ArrayBuffer (byteLength),
+/// Map/Set (size), and any object with a numeric .length property.
+/// TypedArrays ARE supported — returns the element count, not byte length.
+/// Returns -1 if the value has no applicable length.
+int64_t bun_array_length(BunContext* ctx, BunValue value);
 
 // --------------------------------------------------------------------------
 // Object & Property Operations

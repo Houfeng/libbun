@@ -1142,6 +1142,10 @@ pub export fn bun_is_object(value: BunValue) callconv(.c) c_int {
     return if (toJSValue(value).isObject()) 1 else 0;
 }
 
+pub export fn bun_is_array(value: BunValue) callconv(.c) c_int {
+    return if (toJSValue(value).isArray()) 1 else 0;
+}
+
 pub export fn bun_is_callable(value: BunValue) callconv(.c) c_int {
     return if (toJSValue(value).isCallable()) 1 else 0;
 }
@@ -1176,6 +1180,16 @@ pub export fn bun_to_utf8(ctx: ?*BunContext, value: BunValue, out_len: ?*usize) 
     }
 
     return @ptrCast(out_buf);
+}
+
+pub export fn bun_array_length(ctx: ?*BunContext, value: BunValue) callconv(.c) i64 {
+    const global = toGlobal(ctx) orelse return -1;
+    const js_val = toJSValue(value);
+    const len = js_val.getLengthIfPropertyExistsInternal(global) catch return -1;
+    if (len == std.math.floatMax(f64)) {
+        return -1;
+    }
+    return @intFromFloat(std.math.clamp(len, 0, @as(f64, @floatFromInt(@as(i64, std.math.maxInt(i52))))));
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,11 +1555,13 @@ comptime {
     _ = &bun_is_number;
     _ = &bun_is_string;
     _ = &bun_is_object;
+    _ = &bun_is_array;
     _ = &bun_is_callable;
     _ = &bun_to_bool;
     _ = &bun_to_number;
     _ = &bun_to_int32;
     _ = &bun_to_utf8;
+    _ = &bun_array_length;
     _ = &bun_set;
     _ = &bun_get;
     _ = &bun_set_index;
