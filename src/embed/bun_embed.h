@@ -47,7 +47,9 @@ typedef void (*BunSetterFn)(BunContext* ctx, BunValue this_value, BunValue value
 
 /// Finalizer callback for bun_define_finalizer().
 ///
-/// This runs during GC finalization. It must not call back into Bun/JS APIs.
+/// This runs during GC finalization. Do not call Bun or JS APIs from it,
+/// except bun_unprotect() on values that were previously bun_protect()'d and
+/// are being released here. All other Bun or JS APIs are unsupported.
 /// Use it only to release native resources associated with the object.
 /// Each object may have at most one user finalizer registered via
 /// bun_define_finalizer().
@@ -87,7 +89,9 @@ typedef void (*BunClassStaticSetterFn)(BunContext* ctx, BunValue this_value,
 /// Finalizer callback for bun_class_new().
 ///
 /// Runs at most once, either when bun_class_dispose() is called or when the JS
-/// object is eventually GC'd. It must not call back into Bun/JS APIs.
+/// object is eventually GC'd. Do not call Bun or JS APIs from it, except
+/// bun_unprotect() on values that were previously bun_protect()'d and are
+/// being released here. All other Bun or JS APIs are unsupported.
 typedef void (*BunClassFinalizerFn)(void* native_ptr, void* userdata);
 
 typedef struct {
@@ -381,7 +385,9 @@ typedef struct {
 /// @param ctx        JS context.
 /// @param data       Backing memory (must remain valid until finalizer fires).
 /// @param len        Byte length.
-/// @param finalizer  Called on GC collection (may be NULL). Must NOT re-enter Bun/JS.
+/// @param finalizer  Called on GC collection (may be NULL). Must not call Bun
+///                   or JS APIs except bun_unprotect() on values previously
+///                   bun_protect()'d and released here.
 /// @param userdata   Forwarded verbatim to finalizer.
 /// @return           BunValue holding the JS ArrayBuffer, or BUN_UNDEFINED on failure.
 ///                   On failure the finalizer is NOT called — the caller retains ownership.
@@ -408,7 +414,9 @@ BunValue bun_array_buffer(BunContext* ctx, void* data, size_t len,
 /// @param element_count Number of *elements* (not bytes). A size_t overflow
 ///                      check is performed; the call returns BUN_UNDEFINED and
 ///                      does NOT invoke the finalizer if it would overflow.
-/// @param finalizer     Called on GC collection (may be NULL).
+/// @param finalizer     Called on GC collection (may be NULL). Must not call
+///                      Bun or JS APIs except bun_unprotect() on values
+///                      previously bun_protect()'d and released here.
 /// @param userdata      Forwarded verbatim to finalizer.
 /// @return              BunValue holding the TypedArray, or BUN_UNDEFINED on failure.
 ///                      On failure the finalizer is NOT called — caller retains ownership.
