@@ -494,6 +494,22 @@ extern fn BunEmbed__classConstructor(
     class_handle: *BunClass,
 ) JSValue;
 
+extern fn BunEmbed__arrayGetRange(
+    global: *JSGlobalObject,
+    value: JSValue,
+    start: u32,
+    count: u32,
+    out_values: [*]BunValue,
+) bool;
+
+extern fn BunEmbed__arraySetRange(
+    global: *JSGlobalObject,
+    value: JSValue,
+    start: u32,
+    count: u32,
+    values: [*]const BunValue,
+) bool;
+
 const BUN_ACCESSOR_READ_ONLY: u32 = 1 << 0;
 const BUN_ACCESSOR_DONT_ENUM: u32 = 1 << 1;
 const BUN_ACCESSOR_DONT_DELETE: u32 = 1 << 2;
@@ -1435,6 +1451,35 @@ pub export fn bun_array_length(ctx: ?*BunContext, value: BunValue) callconv(.c) 
     return @intFromFloat(std.math.clamp(len, 0, @as(f64, @floatFromInt(@as(i64, std.math.maxInt(i52))))));
 }
 
+fn clearEmbedLastError(global: *JSGlobalObject) ?*BunRuntime {
+    const runtime = vmToRuntime(global.bunVM());
+    if (runtime) |rt| rt.freeLastError();
+    return runtime;
+}
+
+fn failEmbedWithMessage(runtime: ?*BunRuntime, message: []const u8) c_int {
+    if (runtime) |rt| rt.setLastErrorBytes(message);
+    return 0;
+}
+
+fn failEmbedWithException(global: *JSGlobalObject, runtime: ?*BunRuntime, exception: anytype) c_int {
+    if (runtime) |rt| {
+        rt.captureException(global, global.takeException(exception));
+    } else {
+        _ = global.takeException(exception);
+    }
+    return 0;
+}
+
+fn failEmbedWithThrownValue(global: *JSGlobalObject, runtime: ?*BunRuntime, thrown_value: JSValue) c_int {
+    if (runtime) |rt| {
+        rt.captureException(global, thrown_value);
+    } else {
+        global.clearException();
+    }
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Object & Property Operations
 // ---------------------------------------------------------------------------
@@ -1491,6 +1536,82 @@ pub export fn bun_get_index(ctx: ?*BunContext, object: BunValue, index: u32) cal
 
     const value = obj.getIndex(global, index) catch return toBunValue(.js_undefined);
     return toBunValue(value);
+}
+
+pub export fn bun_array_get_range(
+    ctx: ?*BunContext,
+    array: BunValue,
+    start: u32,
+    count: u32,
+    out_values: ?[*]BunValue,
+) callconv(.c) c_int {
+    const global = toGlobal(ctx) orelse return 0;
+    const runtime = clearEmbedLastError(global);
+    const js_array = toJSValue(array);
+
+    if (!js_array.isArray()) {
+        return failEmbedWithMessage(runtime, "value is not a JavaScript Array");
+    }
+
+    _ = std.math.add(u32, start, count) catch {
+        return failEmbedWithMessage(runtime, "array range overflows uint32_t");
+    };
+
+    if (count == 0) return 1;
+
+    const out = out_values orelse return failEmbedWithMessage(runtime, "out_values is null");
+
+    if (!BunEmbed__arrayGetRange(global, js_array, start, count, out)) {
+        if (global.tryTakeException()) |exc| {
+            return failEmbedWithThrownValue(global, runtime, exc);
+        }
+        return failEmbedWithMessage(runtime, "array range read failed");
+    }
+
+    return 1;
+}
+
+pub export fn bun_array_set_range(
+    ctx: ?*BunContext,
+    array: BunValue,
+    start: u32,
+    count: u32,
+    values: ?[*]const BunValue,
+) callconv(.c) c_int {
+    const global = toGlobal(ctx) orelse return 0;
+    const runtime = clearEmbedLastError(global);
+    const js_array = toJSValue(array);
+
+    if (!js_array.isArray()) {
+        return failEmbedWithMessage(runtime, "value is not a JavaScript Array");
+    }
+
+    const end = std.math.add(u32, start, count) catch {
+        return failEmbedWithMessage(runtime, "array range overflows uint32_t");
+    };
+
+    if (count == 0) return 1;
+
+    const length = js_array.getLengthIfPropertyExistsInternal(global) catch |err| {
+        return failEmbedWithException(global, runtime, err);
+    };
+    if (length == std.math.floatMax(f64)) {
+        return failEmbedWithMessage(runtime, "array length is unavailable");
+    }
+    if (length < @as(f64, @floatFromInt(end))) {
+        return failEmbedWithMessage(runtime, "array range exceeds current length");
+    }
+
+    const input = values orelse return failEmbedWithMessage(runtime, "values is null");
+
+    if (!BunEmbed__arraySetRange(global, js_array, start, count, input)) {
+        if (global.tryTakeException()) |exc| {
+            return failEmbedWithThrownValue(global, runtime, exc);
+        }
+        return failEmbedWithMessage(runtime, "array element write was rejected");
+    }
+
+    return 1;
 }
 
 pub export fn bun_define_getter(
@@ -1810,6 +1931,8 @@ comptime {
     _ = &bun_get;
     _ = &bun_set_index;
     _ = &bun_get_index;
+    _ = &bun_array_get_range;
+    _ = &bun_array_set_range;
     _ = &bun_define_getter;
     _ = &bun_define_setter;
     _ = &bun_define_accessor;

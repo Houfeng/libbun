@@ -797,6 +797,72 @@ extern "C" bool BunEmbed__defineFinalizer(
     return true;
 }
 
+extern "C" bool BunEmbed__arrayGetRange(
+    JSGlobalObject* globalObject,
+    EncodedJSValue arrayValue,
+    uint32_t start,
+    uint32_t count,
+    uint64_t* outValues)
+{
+    if (!globalObject)
+        return false;
+    if (count > 0 && !outValues)
+        return false;
+
+    JSValue value = JSValue::decode(arrayValue);
+    if (!JSC::isArray(globalObject, value))
+        return false;
+
+    JSObject* object = value.getObject();
+    if (!object)
+        return false;
+
+    VM& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        JSValue element = object->getIndex(globalObject, start + i);
+        RETURN_IF_EXCEPTION(scope, false);
+        outValues[i] = static_cast<uint64_t>(JSValue::encode(element));
+    }
+
+    return true;
+}
+
+extern "C" bool BunEmbed__arraySetRange(
+    JSGlobalObject* globalObject,
+    EncodedJSValue arrayValue,
+    uint32_t start,
+    uint32_t count,
+    const uint64_t* values)
+{
+    if (!globalObject)
+        return false;
+    if (count > 0 && !values)
+        return false;
+
+    JSValue value = JSValue::decode(arrayValue);
+    if (!JSC::isArray(globalObject, value))
+        return false;
+
+    JSObject* object = value.getObject();
+    if (!object)
+        return false;
+
+    VM& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        JSValue element = JSValue::decode(static_cast<EncodedJSValue>(values[i]));
+        bool didWrite = object->methodTable()->putByIndex(object, globalObject, start + i, element, false);
+        RETURN_IF_EXCEPTION(scope, false);
+        if (!didWrite)
+            return false;
+    }
+
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // ArrayBuffer / TypedArray creation from external C memory (zero-copy)
 // ---------------------------------------------------------------------------

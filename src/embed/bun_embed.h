@@ -523,6 +523,21 @@ BunValue bun_get(BunContext* ctx, BunValue object, const char* key, size_t key_l
 int bun_set_index(BunContext* ctx, BunValue object, uint32_t index, BunValue value);
 BunValue bun_get_index(BunContext* ctx, BunValue object, uint32_t index);
 
+/// Read `count` consecutive elements from a JavaScript Array.
+///
+/// Returns 1 on success, 0 on failure. On failure, bun_last_error() may
+/// describe the reason. `array` must satisfy bun_is_array(). When `count == 0`,
+/// this succeeds and `out_values` may be NULL.
+int bun_array_get_range(BunContext* ctx, BunValue array, uint32_t start, uint32_t count, BunValue* out_values);
+
+/// Write `count` consecutive elements into a JavaScript Array.
+///
+/// Returns 1 on success, 0 on failure. On failure, bun_last_error() may
+/// describe the reason. `array` must satisfy bun_is_array(). Phase 1 does not
+/// grow arrays, so `start + count` must fit within the current array length.
+/// When `count == 0`, this succeeds and `values` may be NULL.
+int bun_array_set_range(BunContext* ctx, BunValue array, uint32_t start, uint32_t count, const BunValue* values);
+
 /// Define or replace only the getter half of an accessor property.
 ///
 /// Getter-only properties are allowed. Repeated calls replace only the getter

@@ -619,6 +619,8 @@ EXPORTS
   bun_get
   bun_set_index
   bun_get_index
+  bun_array_get_range
+  bun_array_set_range
   bun_define_getter
   bun_define_setter
   bun_define_accessor
