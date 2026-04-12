@@ -17,6 +17,8 @@ const expectedRangePasses = [
   "[PASS] bun_array_set_range surfaces JS write failures",
 ];
 
+const symbolsDefFile = resolve(repoRoot, "src/symbols.def");
+
 type TestCase = {
   name: string;
   sourceFile: string;
@@ -26,17 +28,17 @@ type TestCase = {
 
 const tests: TestCase[] = [
   {
-    name: "embed example regression",
-    sourceFile: resolve(repoRoot, "src/embed/test/example.c"),
-    executableName: "embed-example-regression",
+    name: "embed array range regression",
+    sourceFile: resolve(repoRoot, "src/embed/test/test_array_range.c"),
+    executableName: "embed-array-range-regression",
     validateOutput(output) {
       if (output.includes("[FAIL]")) {
-        throw new Error("embed example reported a failure");
+        throw new Error("test_array_range reported a failure");
       }
 
       for (const expected of expectedRangePasses) {
         if (!output.includes(expected)) {
-          throw new Error(`embed example did not report expected regression check: ${expected}`);
+          throw new Error(`test_array_range did not report expected regression check: ${expected}`);
         }
       }
     },
@@ -96,7 +98,23 @@ function importLibraryPath() {
     if (existsSync(candidate)) return candidate;
   }
 
-  throw new Error(`Could not find a Windows import library in ${buildDir}`);
+  const libTool = Bun.which("lib.exe") ?? Bun.which("lib") ?? Bun.which("llvm-lib");
+  if (!libTool) {
+    throw new Error("Could not find a Windows import library or import-library generator");
+  }
+
+  const outputLib = resolve(tempDir, "libbun-generated.lib");
+  const args = [
+    libTool,
+    "/nologo",
+    "/machine:x64",
+    `/def:${symbolsDefFile}`,
+    `/name:${basename(sharedLibraryPath())}`,
+    `/out:${outputLib}`,
+  ];
+
+  runCommand("generate Windows import library", args);
+  return outputLib;
 }
 
 function compilerPath() {
@@ -130,7 +148,7 @@ function compileCommand(test: TestCase) {
       test.sourceFile,
       "/link",
       `/LIBPATH:${buildDir}`,
-      basename(importLib),
+      importLib,
     ];
   }
 
