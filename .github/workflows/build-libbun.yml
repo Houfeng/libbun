@@ -260,6 +260,16 @@ jobs:
         run: |
           & "scripts\vs-shell.ps1" bun scripts/build.ts --profile=release --shared-lib=on --build-dir=build/shared-release
 
+      - name: Run libbun embed example regression (Unix)
+        if: runner.os != 'Windows'
+        run: bun scripts/run-libbun-embed-example.ts
+
+      - name: Run libbun embed example regression (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "scripts\vs-shell.ps1" bun scripts/run-libbun-embed-example.ts
+
       # ── Package ───────────────────────────────────────────
       - name: Package artifact (Unix)
         if: runner.os != 'Windows'
