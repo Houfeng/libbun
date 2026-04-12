@@ -1,5 +1,5 @@
 import { spawnSync } from "bun";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
@@ -178,12 +178,34 @@ function runtimeEnv() {
   }
 
   if (process.platform === "win32") {
+    const windowsPath = [tempDir, buildDir, process.env.Path, process.env.PATH].filter(Boolean).join(";");
     return {
-      PATH: [buildDir, process.env.PATH].filter(Boolean).join(";"),
+      PATH: windowsPath,
+      Path: windowsPath,
     };
   }
 
   return {};
+}
+
+function stageWindowsRuntimeArtifacts() {
+  if (process.platform !== "win32") return;
+
+  const files = readdirSync(buildDir, { withFileTypes: true });
+  let copiedAnyDll = false;
+
+  for (const file of files) {
+    if (!file.isFile()) continue;
+    if (!file.name.toLowerCase().endsWith(".dll")) continue;
+
+    copyFileSync(join(buildDir, file.name), join(tempDir, file.name));
+    copiedAnyDll = true;
+  }
+
+  if (!copiedAnyDll) {
+    const sharedLib = sharedLibraryPath();
+    copyFileSync(sharedLib, join(tempDir, basename(sharedLibraryPath())));
+  }
 }
 
 function runCommand(label: string, cmd: string[], env: Record<string, string> = {}) {
@@ -218,6 +240,8 @@ try {
   if (!existsSync(libPath)) {
     throw new Error(`Shared library not found: ${libPath}`);
   }
+
+  stageWindowsRuntimeArtifacts();
 
   for (const test of tests) {
     if (!existsSync(test.sourceFile)) {
