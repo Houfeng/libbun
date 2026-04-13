@@ -339,6 +339,8 @@ BUN_1.2 {
   bun_array;
   bun_global;
   bun_function;
+  bun_error;
+  bun_throw;
   bun_array_buffer;
   bun_typed_array;
   bun_get_array_buffer;

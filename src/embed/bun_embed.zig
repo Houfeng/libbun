@@ -184,14 +184,18 @@ const BunRuntime = struct {
     }
 
     fn captureException(runtime: *BunRuntime, global: *JSGlobalObject, value: JSValue) void {
-        var thrown_value = if (value.asException(global.vm())) |exception|
-            exception.value()
-        else
-            value;
+        var thrown_value = value;
 
         if (!thrown_value.isAnyError()) {
             if (thrown_value.toError()) |error_like| {
                 thrown_value = error_like;
+            } else if (thrown_value.asException(global.vm())) |exception| {
+                thrown_value = exception.value();
+                if (!thrown_value.isAnyError()) {
+                    if (thrown_value.toError()) |error_like| {
+                        thrown_value = error_like;
+                    }
+                }
             }
         }
 
@@ -1136,6 +1140,20 @@ pub export fn bun_string(ctx: ?*BunContext, utf8: ?[*]const u8, len: usize) call
     return toBunValue(BunString__createUTF8ForJS(global, ptr, len));
 }
 
+pub export fn bun_error(ctx: ?*BunContext, utf8: ?[*]const u8, len: usize) callconv(.c) BunValue {
+    const global = toGlobal(ctx) orelse return toBunValue(.js_undefined);
+    if (utf8 == null and len > 0) return toBunValue(.js_undefined);
+
+    const ptr = utf8 orelse "";
+    const result = global.createErrorInstance("{s}", .{ptr[0..len]});
+    if (result == .zero) {
+        _ = global.clearExceptionExceptTermination();
+        return toBunValue(.js_undefined);
+    }
+
+    return toBunValue(result);
+}
+
 pub export fn bun_object(ctx: ?*BunContext) callconv(.c) BunValue {
     const global = toGlobal(ctx) orelse return toBunValue(.js_undefined);
     return toBunValue(JSValue.createEmptyObject(global, 0));
@@ -1183,6 +1201,9 @@ fn hostFnTrampoline(global: *JSGlobalObject, callframe: *jsc.CallFrame) callconv
         if (args.len == 0) null else @as([*]const BunValue, @ptrCast(args.ptr)),
         cb_data.userdata,
     );
+    if (global.hasException()) {
+        return .zero;
+    }
     return toJSValue(result);
 }
 
@@ -1240,6 +1261,20 @@ pub export fn bun_function(
     }
 
     return toBunValue(js_fn);
+}
+
+pub export fn bun_throw(ctx: ?*BunContext, err: BunValue) callconv(.c) BunValue {
+    const global = toGlobal(ctx) orelse return 0;
+
+    if (global.hasException()) return 0;
+
+    if (err == 0) {
+        _ = global.throwTypeError("bun_throw() does not accept BUN_EXCEPTION", .{}) catch {};
+        return 0;
+    }
+
+    _ = global.throwValue(toJSValue(err)) catch {};
+    return 0;
 }
 
 pub export fn bun_array_buffer(
@@ -1902,6 +1937,8 @@ comptime {
     _ = &bun_array;
     _ = &bun_global;
     _ = &bun_function;
+    _ = &bun_error;
+    _ = &bun_throw;
     _ = &bun_array_buffer;
     _ = &bun_typed_array;
     _ = &bun_get_array_buffer;

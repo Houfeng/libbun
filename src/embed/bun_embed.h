@@ -37,12 +37,18 @@ typedef uint64_t BunValue;
 
 /// Host function callback callable from JavaScript.
 /// argv points to contiguous BunValue arguments valid only for this call.
+/// To raise a JavaScript exception from a callback, call bun_throw(ctx, err)
+/// and return promptly.
 typedef BunValue (*BunHostFn)(BunContext* ctx, int argc, const BunValue* argv, void* userdata);
 
 /// Custom getter callback for bun_define_accessor().
+/// To raise a JavaScript exception from a callback, call bun_throw(ctx, err)
+/// and return promptly.
 typedef BunValue (*BunGetterFn)(BunContext* ctx, BunValue this_value, void* userdata);
 
 /// Custom setter callback for bun_define_accessor().
+/// To raise a JavaScript exception from a callback, call bun_throw(ctx, err)
+/// and return promptly.
 typedef void (*BunSetterFn)(BunContext* ctx, BunValue this_value, BunValue value, void* userdata);
 
 /// Finalizer callback for bun_define_finalizer().
@@ -56,13 +62,19 @@ typedef void (*BunSetterFn)(BunContext* ctx, BunValue this_value, BunValue value
 typedef void (*BunFinalizerFn)(void* userdata);
 
 /// Native instance method callback for bun_class_register().
+/// To raise a JavaScript exception from a callback, call bun_throw(ctx, err)
+/// and return promptly.
 typedef BunValue (*BunClassMethodFn)(BunContext* ctx, BunValue this_value, void* native_ptr,
     int argc, const BunValue* argv, void* userdata);
 
 /// Native property getter callback for bun_class_register().
+/// To raise a JavaScript exception from a callback, call bun_throw(ctx, err)
+/// and return promptly.
 typedef BunValue (*BunClassGetterFn)(BunContext* ctx, BunValue this_value, void* native_ptr, void* userdata);
 
 /// Native property setter callback for bun_class_register().
+/// To raise a JavaScript exception from a callback, call bun_throw(ctx, err)
+/// and return promptly.
 typedef void (*BunClassSetterFn)(BunContext* ctx, BunValue this_value, void* native_ptr,
     BunValue value, void* userdata);
 
@@ -70,19 +82,27 @@ typedef void (*BunClassSetterFn)(BunContext* ctx, BunValue this_value, void* nat
 ///
 /// This is invoked for JavaScript `new` calls on the class constructor returned
 /// by bun_class_constructor(). The callback should typically allocate native
-/// state and return a BunClass instance created via bun_class_new().
+/// state and return a BunClass instance created via bun_class_new(). To raise
+/// a JavaScript exception instead, call bun_throw(ctx, err) and return
+/// promptly.
 typedef BunValue (*BunClassConstructorFn)(BunContext* ctx, BunClass* klass,
     int argc, const BunValue* argv, void* userdata);
 
 /// Native static method callback for bun_class_register().
+/// To raise a JavaScript exception from a callback, call bun_throw(ctx, err)
+/// and return promptly.
 typedef BunValue (*BunClassStaticMethodFn)(BunContext* ctx, BunValue this_value,
     void* userdata, int argc, const BunValue* argv);
 
 /// Native static property getter callback for bun_class_register().
+/// To raise a JavaScript exception from a callback, call bun_throw(ctx, err)
+/// and return promptly.
 typedef BunValue (*BunClassStaticGetterFn)(BunContext* ctx, BunValue this_value,
     void* userdata);
 
 /// Native static property setter callback for bun_class_register().
+/// To raise a JavaScript exception from a callback, call bun_throw(ctx, err)
+/// and return promptly.
 typedef void (*BunClassStaticSetterFn)(BunContext* ctx, BunValue this_value,
     BunValue value, void* userdata);
 
@@ -329,6 +349,39 @@ BunValue bun_object(BunContext* ctx);
 BunValue bun_array(BunContext* ctx, size_t len);
 BunValue bun_global(BunContext* ctx);
 BunValue bun_function(BunContext* ctx, const char* name, size_t name_len, BunHostFn fn, void* userdata, int arg_count);
+
+// --------------------------------------------------------------------------
+// Error Helpers
+// --------------------------------------------------------------------------
+
+/// Construct a JavaScript Error object from a UTF-8 message without throwing it.
+///
+/// Typical usage:
+///   BunValue err = bun_error(ctx, "boom", 4);
+///   return bun_throw(ctx, err);
+///
+/// The returned value may also be stored, passed around, or thrown later.
+/// Returns BUN_UNDEFINED on failure.
+BunValue bun_error(BunContext* ctx, const char* utf8, size_t len);
+
+/// Raise a pending JavaScript exception from native embed code.
+///
+/// `err` may be any BunValue from the same runtime/context. JavaScript code
+/// catches the original thrown value via try/catch.
+///
+/// Usage from BunValue-returning callbacks:
+///   return bun_throw(ctx, err);
+///
+/// Usage from setter/void callbacks:
+///   bun_throw(ctx, err);
+///   return;
+///
+/// After calling bun_throw(), return promptly so control can unwind back into
+/// JavaScript. Passing BUN_EXCEPTION is invalid; bun_throw() raises a
+/// TypeError instead.
+///
+/// @return BUN_EXCEPTION for convenience.
+BunValue bun_throw(BunContext* ctx, BunValue err);
 
 /// Element type for bun_typed_array().
 typedef enum {

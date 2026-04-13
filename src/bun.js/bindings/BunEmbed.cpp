@@ -179,6 +179,25 @@ static WTF::String stringFromStdString(const std::string& value)
     return WTF::String::fromUTF8(std::span { value.data(), value.size() });
 }
 
+static EncodedJSValue bunEmbedReturnEncodedUnlessException(ThrowScope& scope, EncodedJSValue value)
+{
+    RETURN_IF_EXCEPTION(scope, {});
+    RELEASE_AND_RETURN(scope, value);
+}
+
+static EncodedJSValue bunEmbedReturnUndefinedUnlessException(ThrowScope& scope)
+{
+    RETURN_IF_EXCEPTION(scope, {});
+    RELEASE_AND_RETURN(scope, JSValue::encode(jsUndefined()));
+}
+
+static bool bunEmbedReturnBoolUnlessException(ThrowScope& scope, bool value)
+{
+    RETURN_IF_EXCEPTION(scope, false);
+    scope.release();
+    return value;
+}
+
 JSC_DECLARE_HOST_FUNCTION(BunEmbed_classConstructorCall);
 JSC_DECLARE_HOST_FUNCTION(BunEmbed_classConstructorConstruct);
 JSC_DECLARE_HOST_FUNCTION(BunEmbed_classPropertyGetterDispatcher);
@@ -272,6 +291,8 @@ JSC_DEFINE_HOST_FUNCTION(BunEmbed_classConstructorConstruct, (JSGlobalObject * g
         static_cast<int>(argCount),
         argCount == 0 ? nullptr : encodedArgs.mutableSpan().data(),
         registeredClass->constructorUserdata));
+
+    RETURN_IF_EXCEPTION(scope, {});
 
     if (!result.isObject()) {
         throwTypeError(globalObject, scope, "Class constructor must return an object"_s);
@@ -446,8 +467,9 @@ JSC_DEFINE_HOST_FUNCTION(BunEmbed_classPropertyGetterDispatcher, (JSGlobalObject
         return JSValue::encode(jsUndefined());
 
     const BunEmbedRegisteredProperty* property = propertyIt->second;
-
-    return static_cast<EncodedJSValue>(property->getter(static_cast<void*>(globalObject), static_cast<uint64_t>(JSValue::encode(callFrame->thisValue())), instance->nativePtr(), property->userdata));
+    auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
+    EncodedJSValue result = static_cast<EncodedJSValue>(property->getter(static_cast<void*>(globalObject), static_cast<uint64_t>(JSValue::encode(callFrame->thisValue())), instance->nativePtr(), property->userdata));
+    return bunEmbedReturnEncodedUnlessException(scope, result);
 }
 
 JSC_DEFINE_HOST_FUNCTION(BunEmbed_classPropertySetterDispatcher, (JSGlobalObject * globalObject, CallFrame* callFrame))
@@ -469,8 +491,9 @@ JSC_DEFINE_HOST_FUNCTION(BunEmbed_classPropertySetterDispatcher, (JSGlobalObject
         return JSValue::encode(jsUndefined());
 
     JSValue value = callFrame->argumentCount() > 0 ? callFrame->uncheckedArgument(0) : jsUndefined();
+    auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
     property->setter(static_cast<void*>(globalObject), static_cast<uint64_t>(JSValue::encode(callFrame->thisValue())), instance->nativePtr(), static_cast<uint64_t>(JSValue::encode(value)), property->userdata);
-    return JSValue::encode(jsUndefined());
+    return bunEmbedReturnUndefinedUnlessException(scope);
 }
 
 JSC_DEFINE_HOST_FUNCTION(BunEmbed_classMethodDispatcher, (JSGlobalObject * globalObject, CallFrame* callFrame))
@@ -494,13 +517,15 @@ JSC_DEFINE_HOST_FUNCTION(BunEmbed_classMethodDispatcher, (JSGlobalObject * globa
         encodedArgs[i] = static_cast<uint64_t>(JSValue::encode(callFrame->uncheckedArgument(i)));
     }
 
-    return static_cast<EncodedJSValue>(method->callback(
+    auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
+    EncodedJSValue result = static_cast<EncodedJSValue>(method->callback(
         static_cast<void*>(globalObject),
         static_cast<uint64_t>(JSValue::encode(callFrame->thisValue())),
         instance->nativePtr(),
         static_cast<int>(argCount),
         argCount == 0 ? nullptr : encodedArgs.mutableSpan().data(),
         method->userdata));
+    return bunEmbedReturnEncodedUnlessException(scope, result);
 }
 
 JSC_DEFINE_HOST_FUNCTION(BunEmbed_classStaticPropertyGetterDispatcher, (JSGlobalObject * globalObject, CallFrame* callFrame))
@@ -514,10 +539,12 @@ JSC_DEFINE_HOST_FUNCTION(BunEmbed_classStaticPropertyGetterDispatcher, (JSGlobal
         return JSValue::encode(jsUndefined());
 
     const BunEmbedRegisteredStaticProperty* property = propertyIt->second;
-    return static_cast<EncodedJSValue>(property->getter(
+    auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
+    EncodedJSValue result = static_cast<EncodedJSValue>(property->getter(
         static_cast<void*>(globalObject),
         static_cast<uint64_t>(JSValue::encode(callFrame->thisValue())),
         property->userdata));
+    return bunEmbedReturnEncodedUnlessException(scope, result);
 }
 
 JSC_DEFINE_HOST_FUNCTION(BunEmbed_classStaticPropertySetterDispatcher, (JSGlobalObject * globalObject, CallFrame* callFrame))
@@ -535,12 +562,13 @@ JSC_DEFINE_HOST_FUNCTION(BunEmbed_classStaticPropertySetterDispatcher, (JSGlobal
         return JSValue::encode(jsUndefined());
 
     JSValue value = callFrame->argumentCount() > 0 ? callFrame->uncheckedArgument(0) : jsUndefined();
+    auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
     property->setter(
         static_cast<void*>(globalObject),
         static_cast<uint64_t>(JSValue::encode(callFrame->thisValue())),
         static_cast<uint64_t>(JSValue::encode(value)),
         property->userdata);
-    return JSValue::encode(jsUndefined());
+    return bunEmbedReturnUndefinedUnlessException(scope);
 }
 
 JSC_DEFINE_HOST_FUNCTION(BunEmbed_classStaticMethodDispatcher, (JSGlobalObject * globalObject, CallFrame* callFrame))
@@ -560,12 +588,14 @@ JSC_DEFINE_HOST_FUNCTION(BunEmbed_classStaticMethodDispatcher, (JSGlobalObject *
         encodedArgs[i] = static_cast<uint64_t>(JSValue::encode(callFrame->uncheckedArgument(i)));
     }
 
-    return static_cast<EncodedJSValue>(method->callback(
+    auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
+    EncodedJSValue result = static_cast<EncodedJSValue>(method->callback(
         static_cast<void*>(globalObject),
         static_cast<uint64_t>(JSValue::encode(callFrame->thisValue())),
         method->userdata,
         static_cast<int>(argCount),
         argCount == 0 ? nullptr : encodedArgs.mutableSpan().data()));
+    return bunEmbedReturnEncodedUnlessException(scope, result);
 }
 
 static void destroyRegisteredClass(BunEmbedRegisteredClass* registeredClass)
@@ -654,7 +684,9 @@ JSC_DEFINE_CUSTOM_GETTER(BunEmbed_customGetter, (JSGlobalObject * globalObject, 
         entry = innerIt->second;
     }
 
-    return static_cast<EncodedJSValue>(entry.getter(static_cast<void*>(globalObject), static_cast<uint64_t>(thisValue), entry.getter_userdata));
+    auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
+    EncodedJSValue result = static_cast<EncodedJSValue>(entry.getter(static_cast<void*>(globalObject), static_cast<uint64_t>(thisValue), entry.getter_userdata));
+    return bunEmbedReturnEncodedUnlessException(scope, result);
 }
 
 JSC_DEFINE_CUSTOM_SETTER(BunEmbed_customSetter, (JSGlobalObject * globalObject, EncodedJSValue thisValue, EncodedJSValue value, PropertyName propertyName))
@@ -678,8 +710,9 @@ JSC_DEFINE_CUSTOM_SETTER(BunEmbed_customSetter, (JSGlobalObject * globalObject, 
         entry = innerIt->second;
     }
 
+    auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
     entry.setter(static_cast<void*>(globalObject), static_cast<uint64_t>(thisValue), static_cast<uint64_t>(value), entry.setter_userdata);
-    return true;
+    return bunEmbedReturnBoolUnlessException(scope, true);
 }
 
 extern "C" bool BunEmbed__defineCustomAccessor(

@@ -43,6 +43,16 @@ const tests: TestCase[] = [
       }
     },
   },
+  {
+    name: "embed throw regression",
+    sourceFile: resolve(repoRoot, "src/embed/test/test_throw.c"),
+    executableName: "embed-throw-regression",
+    validateOutput(output) {
+      if (output.includes("[FAIL]")) {
+        throw new Error("test_throw reported a failure");
+      }
+    },
+  },
 ];
 
 if (process.platform !== "win32") {

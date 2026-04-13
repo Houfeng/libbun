@@ -570,6 +570,8 @@
     _bun_array;
     _bun_global;
     _bun_function;
+    _bun_error;
+    _bun_throw;
     _bun_array_buffer;
     _bun_typed_array;
     _bun_get_array_buffer;
