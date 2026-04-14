@@ -862,23 +862,40 @@ const TickContext = struct {
 
     pub fn run(this: *TickContext) void {
         const vm = this.runtime.vm;
+        var event_loop = vm.eventLoop();
 
         drainPendingCalls(this.runtime, vm.global);
 
-        // Non-blocking tick: process ready tasks + microtasks
-        vm.eventLoop().tick();
+        // Match Bun's normal non-blocking progression more closely:
+        // immediates -> ready tasks -> zero-timeout I/O -> due timers -> follow-up tasks.
+        event_loop.tickImmediateTasks(vm);
+        event_loop.tick();
 
-        // Also do a non-blocking I/O poll (kqueue/epoll on POSIX, IOCP via libuv on Windows)
         if (vm.event_loop_handle) |loop| {
             if (comptime Environment.isPosix) {
-                loop.tickWithoutIdle(); // us_loop_run_bun_tick with zero timeout
+                const pending_unref = vm.pending_unref_counter;
+                if (pending_unref > 0) {
+                    vm.pending_unref_counter = 0;
+                    loop.unrefCount(pending_unref);
+                }
+            }
+
+            vm.timer.updateDateHeaderTimerIfNecessary(loop, vm);
+
+            // Non-blocking I/O poll (kqueue/epoll on POSIX, IOCP via libuv on Windows)
+            if (comptime Environment.isPosix) {
+                loop.tickWithoutIdle();
+                vm.timer.drainTimers(vm);
             } else {
-                loop.tickWithTimeout(0); // uv_run(UV_RUN_NOWAIT)
+                loop.tickWithTimeout(0);
             }
         }
 
-        // Process any tasks that became ready from I/O
-        vm.eventLoop().tick();
+        vm.onAfterEventLoop();
+
+        // Process tasks made ready by I/O, timers, or deferred after-event-loop callbacks.
+        event_loop.tick();
+        vm.global.handleRejectedPromises();
 
         this.has_pending = vm.isEventLoopAlive();
     }
