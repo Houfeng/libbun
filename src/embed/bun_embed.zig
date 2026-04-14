@@ -99,6 +99,12 @@ const BunTypedArrayInfo = extern struct {
     kind: u32,
 };
 
+const BunPendingJobsResult = enum(c_int) {
+    idle = 0,
+    spin = 1,
+    wait = 2,
+};
+
 const HostFnData = struct {
     native_fn: BunHostFn,
     userdata: ?*anyopaque,
@@ -814,9 +820,9 @@ const EvalFileContext = struct {
 // Event Loop Integration
 // ---------------------------------------------------------------------------
 
-pub export fn bun_run_pending_jobs(rt: ?*BunRuntime) callconv(.c) c_int {
-    const runtime = rt orelse return 0;
-    var tick_ctx = TickContext{ .runtime = runtime, .has_pending = false };
+pub export fn bun_run_pending_jobs(rt: ?*BunRuntime) callconv(.c) BunPendingJobsResult {
+    const runtime = rt orelse return .idle;
+    var tick_ctx = TickContext{ .runtime = runtime, .result = .idle };
     runtime.vm.runWithAPILock(TickContext, &tick_ctx, TickContext.run);
     // Windows: signal the watcher thread that we have finished processing so
     // it can safely resumes its GetQueuedCompletionStatusEx blocking loop.
@@ -825,12 +831,69 @@ pub export fn bun_run_pending_jobs(rt: ?*BunRuntime) callconv(.c) c_int {
     if (comptime Environment.isWindows) {
         if (runtime.event_watcher_win_handle) |h| _ = win32.SetEvent(h);
     }
-    return if (tick_ctx.has_pending) 1 else 0;
+    return tick_ctx.result;
 }
 
 const TickContext = struct {
     runtime: *BunRuntime,
-    has_pending: bool,
+    result: BunPendingJobsResult,
+
+    fn hasQueuedPendingCalls(runtime: *BunRuntime) bool {
+        runtime.pending_calls_mutex.lock();
+        defer runtime.pending_calls_mutex.unlock();
+        return runtime.pending_calls.items.len > 0;
+    }
+
+    fn hasDueTimerNow(vm: *VirtualMachine) bool {
+        const timers = &vm.timer;
+        timers.lock.lock();
+        defer timers.lock.unlock();
+
+        const timer = timers.timers.peek() orelse return false;
+        const now = bun.timespec.now(.allow_mocked_time);
+        return !timer.next.greater(&now);
+    }
+
+    fn hasImmediateProgressAvailable(runtime: *BunRuntime) bool {
+        const vm = runtime.vm;
+        const event_loop = vm.eventLoop();
+
+        if (hasQueuedPendingCalls(runtime)) return true;
+        if (vm.pending_unref_counter > 0) return true;
+        if (vm.after_event_loop_callback != null) return true;
+        if (event_loop.tasks.count > 0) return true;
+        if (event_loop.immediate_tasks.items.len > 0) return true;
+        if (event_loop.next_immediate_tasks.items.len > 0) return true;
+        if (event_loop.deferred_tasks.map.count() > 0) return true;
+        if (!event_loop.concurrent_tasks.isEmpty()) return true;
+        if (hasDueTimerNow(vm)) return true;
+
+        if (vm.event_loop_handle) |loop| {
+            if (comptime Environment.isPosix) {
+                var pfd = [1]std.posix.pollfd{.{
+                    .fd = loop.fd,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
+                return (std.posix.poll(&pfd, 0) catch 0) > 0;
+            }
+
+            return bun.windows.libuv.uv_backend_timeout(loop) == 0;
+        }
+
+        return false;
+    }
+
+    fn hasFuturePendingWork(runtime: *BunRuntime) bool {
+        const vm = runtime.vm;
+        const event_loop = vm.eventLoop();
+
+        return vm.isEventLoopAlive() or
+            !event_loop.concurrent_tasks.isEmpty() or
+            vm.after_event_loop_callback != null or
+            event_loop.deferred_tasks.map.count() > 0 or
+            hasQueuedPendingCalls(runtime);
+    }
 
     fn drainPendingCalls(runtime: *BunRuntime, global: *JSGlobalObject) void {
         runtime.pending_calls_mutex.lock();
@@ -897,7 +960,12 @@ const TickContext = struct {
         event_loop.tick();
         vm.global.handleRejectedPromises();
 
-        this.has_pending = vm.isEventLoopAlive();
+        this.result = if (hasImmediateProgressAvailable(this.runtime))
+            .spin
+        else if (hasFuturePendingWork(this.runtime))
+            .wait
+        else
+            .idle;
     }
 };
 

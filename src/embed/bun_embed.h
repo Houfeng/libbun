@@ -209,6 +209,16 @@ typedef struct {
     const char* debugger_listen_url;
 } BunInitializeOptions;
 
+/// Result of a non-blocking embed event-loop tick.
+typedef enum {
+    /// Runtime is fully idle: no queued work and no active handles/timers.
+    BUN_PENDING_JOBS_IDLE = 0,
+    /// More work can be processed immediately without waiting for a new wakeup.
+    BUN_PENDING_JOBS_SPIN = 1,
+    /// Runtime is still active, but further progress requires a future wakeup.
+    BUN_PENDING_JOBS_WAIT = 2,
+} BunPendingJobsResult;
+
 // --------------------------------------------------------------------------
 // Lifecycle
 // --------------------------------------------------------------------------
@@ -265,9 +275,21 @@ BunValue bun_eval_file(BunContext* ctx, const char* path, size_t path_len);
 /// This performs a single non-blocking tick: it processes all currently ready
 /// events and returns immediately. It will NOT block waiting for new events.
 ///
+/// Return-value semantics:
+///   - BUN_PENDING_JOBS_IDLE: fully idle.
+///   - BUN_PENDING_JOBS_SPIN: more work is runnable immediately; call again now.
+///   - BUN_PENDING_JOBS_WAIT: the runtime is still active, but you should wait
+///     for the next host wakeup instead of busy-looping.
+///
+/// Typical GUI integration:
+///   - SPIN: keep draining in a bounded inner loop.
+///   - WAIT: return to the GUI loop and wait for bun_get_event_fd() or
+///     bun_set_event_callback() to wake you.
+///   - IDLE: runtime is quiescent.
+///
 /// @param rt  Runtime handle.
-/// @return    1 if the event loop has more pending work, 0 if idle.
-int bun_run_pending_jobs(BunRuntime* rt);
+/// @return    Tri-state result describing whether to stop, spin, or wait.
+BunPendingJobsResult bun_run_pending_jobs(BunRuntime* rt);
 
 /// Get the underlying OS event loop file descriptor (epoll fd on Linux,
 /// kqueue fd on macOS). You can monitor this fd with poll()/select() or your

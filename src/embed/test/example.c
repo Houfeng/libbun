@@ -1029,12 +1029,24 @@ int main(void)
 #undef EVAL
 
     printf("\n--- Running event loop ---\n");
-    for (int i = 0; i < 100; i++) {
-        int has_pending = bun_run_pending_jobs(rt);
-        if (!has_pending) {
-            printf("Event loop idle, stopping.\n");
+    for (int frame = 0; frame < 100; frame++) {
+        int spins = 0;
+        while (1) {
+            BunPendingJobsResult status = bun_run_pending_jobs(rt);
+            if (status == BUN_PENDING_JOBS_IDLE) {
+                printf("Event loop idle, stopping.\n");
+                frame = 100;
+                break;
+            }
+            if (status == BUN_PENDING_JOBS_WAIT || ++spins >= 32) {
+                break;
+            }
+        }
+
+        if (frame >= 100) {
             break;
         }
+
         usleep(50000); // 50ms - simulate frame rate
     }
 
