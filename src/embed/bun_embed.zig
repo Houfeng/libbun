@@ -858,7 +858,14 @@ const TickContext = struct {
         return !timer.next.greater(&now);
     }
 
-    fn hasImmediateProgressAvailable(runtime: *BunRuntime) bool {
+    /// Check whether there is queued work in any of the Zig-level task
+    /// queues.  This intentionally does NOT poll the underlying I/O fd
+    /// (kqueue/epoll/IOCP) because after run() has already executed
+    /// tickWithoutIdle + tick, any residual readiness on the fd is from
+    /// internal housekeeping (GC timers, wakeup async) rather than
+    /// actionable JS work.  Polling the fd here caused perpetual spin
+    /// when no user script had been evaluated.
+    fn hasQueuedTaskWork(runtime: *BunRuntime) bool {
         const vm = runtime.vm;
         const event_loop = vm.eventLoop();
 
@@ -872,6 +879,16 @@ const TickContext = struct {
         if (!event_loop.concurrent_tasks.isEmpty()) return true;
         if (hasDueTimerNow(vm)) return true;
 
+        return false;
+    }
+
+    /// Like hasQueuedTaskWork but also probes the underlying I/O fd for
+    /// readiness.  Used by getWaitHintMs (called from the watcher thread
+    /// or host) where I/O readiness must be detected before any tick.
+    fn hasImmediateProgressAvailable(runtime: *BunRuntime) bool {
+        if (hasQueuedTaskWork(runtime)) return true;
+
+        const vm = runtime.vm;
         if (vm.event_loop_handle) |loop| {
             if (comptime Environment.isPosix) {
                 var pfd = [1]std.posix.pollfd{.{
@@ -1002,7 +1019,7 @@ const TickContext = struct {
         event_loop.tick();
         vm.global.handleRejectedPromises();
 
-        this.result = if (hasImmediateProgressAvailable(this.runtime))
+        this.result = if (hasQueuedTaskWork(this.runtime))
             .spin
         else if (hasFuturePendingWork(this.runtime))
             .wait

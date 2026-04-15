@@ -160,4 +160,5 @@
   "bun.test.customScript": "./build/debug/bun-debug test",
   "zig.libPath": "${workspaceFolder}/vendor/zig/lib",
   "cSpell.words": ["boringssl", "Finalizer", "libbun", "NASM"],
+  "vsicons.presets.angular": true,
 }
