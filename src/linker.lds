@@ -329,6 +329,7 @@ BUN_1.2 {
   bun_eval_file;
   bun_run_pending_jobs;
   bun_get_event_fd;
+  bun_get_wait_hint;
   bun_wakeup;
   bun_set_event_callback;
   bun_bool;

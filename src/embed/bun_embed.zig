@@ -985,7 +985,7 @@ const TickContext = struct {
                 }
             }
 
-            vm.timer.updateDateHeaderTimerIfNecessary(loop, vm);
+            vm.timer.updateDateHeaderTimerIfNecessary(vm.uwsLoop(), vm);
 
             // Non-blocking I/O poll (kqueue/epoll on POSIX, IOCP via libuv on Windows)
             if (comptime Environment.isPosix) {
