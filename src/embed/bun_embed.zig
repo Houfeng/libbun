@@ -926,7 +926,12 @@ const TickContext = struct {
     /// thread. It acquires the timer lock to peek at the heap and does not
     /// mutate state (unlike Timer.All.getTimeout which has side effects).
     fn getWaitHintMs(runtime: *BunRuntime) i64 {
-        if (hasImmediateProgressAvailable(runtime)) return 0;
+        // Use hasQueuedTaskWork (no fd poll) instead of
+        // hasImmediateProgressAvailable. Polling the kqueue/epoll fd
+        // produces false positives from internal fallthrough events
+        // (GC repeating timer) that tickWithoutIdle never consumes
+        // when num_polls == 0.
+        if (hasQueuedTaskWork(runtime)) return 0;
 
         const vm = runtime.vm;
         if (comptime Environment.isPosix) {
@@ -1119,9 +1124,24 @@ fn watcherThread(runtime: *BunRuntime) void {
 
             if (runtime.event_watcher_stop.load(.acquire)) break;
 
-            // Notify when: poll returned ready events (n > 0), OR
-            // the timeout expired and there was a non-negative hint (timer due).
-            const should_notify = (n > 0) or (n == 0 and hint >= 0);
+            // Determine whether the host should tick.
+            //
+            // When poll reports readiness (n > 0) it might be real I/O
+            // OR an internal fallthrough event (GC repeating timer,
+            // async wakeup) whose EVFILT_TIMER / EVFILT_MACHPORT sits
+            // in kqueue but is never consumed by tickWithoutIdle when
+            // num_polls == 0.  Blindly notifying in that case causes
+            // the callback to fire in a tight loop.
+            //
+            // Rule: treat poll readiness as genuine only when real I/O
+            // polls are registered (num_polls > 0) — the subsequent
+            // bun_run_pending_jobs will call kevent64 and consume the
+            // events.  When num_polls == 0 we fall through to the task-
+            // queue / timer-heap check.
+            const has_real_io_polls = loop.num_polls > 0;
+            const should_notify = (n > 0 and has_real_io_polls) or
+                (n == 0 and hint >= 0) or
+                TickContext.hasQueuedTaskWork(runtime);
             if (!should_notify) continue;
 
             if (runtime.event_callback_fn) |cb| {
