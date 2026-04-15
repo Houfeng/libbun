@@ -131,20 +131,14 @@ const PendingCall = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Windows-only Win32 helpers for the event watcher background thread.
-// Declared here (rather than via std.os.windows.kernel32) because SetEvent
-// and CreateEventW are not all exposed by Zig's standard library.
+// Futex-based ACK primitive for the event watcher background thread.
+// Uses a single std.atomic.Value(u32) + std.Thread.Futex across all
+// platforms (Linux: futex(), macOS: __ulock_wait2(), Windows:
+// RtlWaitOnAddress()). This replaces the previous platform-split approach
+// (POSIX std.Thread.Semaphore / Windows CreateEventW) with a unified
+// single-syscall mechanism.
 // ---------------------------------------------------------------------------
-const win32 = if (Environment.isWindows) struct {
-    const w = std.os.windows;
-    extern "kernel32" fn CreateEventW(
-        lpEventAttributes: ?*anyopaque,
-        bManualReset: w.BOOL,
-        bInitialState: w.BOOL,
-        lpName: ?w.LPCWSTR,
-    ) callconv(.winapi) ?w.HANDLE;
-    extern "kernel32" fn SetEvent(hEvent: w.HANDLE) callconv(.winapi) w.BOOL;
-} else void;
+const Futex = std.Thread.Futex;
 
 /// Opaque runtime handle exposed to C as `BunRuntime*`.
 const BunRuntime = struct {
@@ -174,10 +168,16 @@ const BunRuntime = struct {
     event_watcher_thread: ?std.Thread = null,
     /// Set to true to ask the watcher thread to exit.
     event_watcher_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Windows only: auto-reset Win32 event that wakes the watcher thread early
-    /// (e.g. when bun_wakeup() is called from another thread).
-    event_watcher_win_handle: if (Environment.isWindows) ?std.os.windows.HANDLE else void =
-        if (Environment.isWindows) null else {},
+    /// Futex-based ACK primitive — unified across all platforms.
+    /// 0 = watcher is waiting (or will wait soon); 1 = ACK posted.
+    /// Watcher: stores 0, then Futex.wait(&ack, 0) blocks until value != 0.
+    /// Host:    stores 1, then Futex.wake(&ack, 1) unblocks the watcher.
+    /// Single kernel syscall per platform (futex / __ulock / RtlWaitOnAddress).
+    event_watcher_ack: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Set to true by the watcher thread after it has fired the callback and
+    /// is waiting for ACK. Checked by bun_run_pending_jobs() to avoid posting
+    /// a stale ACK when the watcher hasn't actually notified the host yet.
+    event_watcher_needs_ack: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn setLastErrorBytes(runtime: *BunRuntime, bytes: []const u8) void {
         const err_str = bun.default_allocator.allocSentinel(u8, bytes.len, 0) catch return;
@@ -824,12 +824,16 @@ pub export fn bun_run_pending_jobs(rt: ?*BunRuntime) callconv(.c) BunPendingJobs
     const runtime = rt orelse return .idle;
     var tick_ctx = TickContext{ .runtime = runtime, .result = .idle };
     runtime.vm.runWithAPILock(TickContext, &tick_ctx, TickContext.run);
-    // Windows: signal the watcher thread that we have finished processing so
-    // it can safely resumes its GetQueuedCompletionStatusEx blocking loop.
-    // The ACK prevents the watcher from immediately re-dequeuing the packets
-    // it just re-enqueued before libuv has had a chance to consume them.
-    if (comptime Environment.isWindows) {
-        if (runtime.event_watcher_win_handle) |h| _ = win32.SetEvent(h);
+    // Signal the watcher thread that we have finished processing so it can
+    // safely resume its blocking wait (poll on POSIX, IOCP on Windows).
+    // Only post ACK if the watcher has actually notified us and is waiting;
+    // this prevents stale ACKs from accumulating.
+    if (runtime.event_watcher_thread != null and
+        !runtime.event_watcher_stop.load(.acquire) and
+        runtime.event_watcher_needs_ack.swap(false, .acq_rel))
+    {
+        runtime.event_watcher_ack.store(1, .release);
+        Futex.wake(&runtime.event_watcher_ack, 1);
     }
     return tick_ctx.result;
 }
@@ -893,6 +897,44 @@ const TickContext = struct {
             vm.after_event_loop_callback != null or
             event_loop.deferred_tasks.map.count() > 0 or
             hasQueuedPendingCalls(runtime);
+    }
+
+    /// Compute the wait hint in milliseconds for the embed host or the
+    /// internal watcher thread.
+    ///   0  = work is runnable right now (immediate tasks, due timers, etc.)
+    ///  -1  = no timers pending; block indefinitely on I/O / wakeup
+    ///  >0  = milliseconds until the next timer fires
+    ///
+    /// Thread safety: this function is safe to call from the background watcher
+    /// thread. It acquires the timer lock to peek at the heap and does not
+    /// mutate state (unlike Timer.All.getTimeout which has side effects).
+    fn getWaitHintMs(runtime: *BunRuntime) i64 {
+        if (hasImmediateProgressAvailable(runtime)) return 0;
+
+        const vm = runtime.vm;
+        if (comptime Environment.isPosix) {
+            // Check immediate_tasks first (same as getTimeout, no lock needed).
+            if (vm.event_loop.immediate_tasks.items.len > 0) return 0;
+
+            // Peek the timer heap under lock — do NOT use getTimeout() because
+            // it has side effects (fires WTFTimer) that are unsafe from the
+            // background watcher thread.
+            const timers = &vm.timer;
+            timers.lock.lock();
+            defer timers.lock.unlock();
+
+            const min = timers.timers.peek() orelse return -1;
+            const now = bun.timespec.now(.allow_mocked_time);
+            if (!min.next.greater(&now)) return 0; // timer already due
+            const spec = min.next.duration(&now);
+            const ms: i64 = spec.sec * 1000 + @divTrunc(spec.nsec, 1_000_000);
+            return if (ms <= 0) 1 else ms;
+        } else {
+            if (vm.event_loop_handle) |loop| {
+                return bun.windows.libuv.uv_backend_timeout(loop);
+            }
+            return -1;
+        }
     }
 
     fn drainPendingCalls(runtime: *BunRuntime, global: *JSGlobalObject) void {
@@ -985,6 +1027,15 @@ pub export fn bun_get_event_fd(rt: ?*BunRuntime) callconv(.c) c_int {
     return -1;
 }
 
+/// Returns the recommended wait timeout in milliseconds for the embed host.
+///   0  = work is runnable right now; call bun_run_pending_jobs() immediately.
+///  -1  = no JS timers pending; wait indefinitely on I/O / bun_wakeup().
+///  >0  = milliseconds until the next JS timer fires; use as poll/select timeout.
+pub export fn bun_get_wait_hint(rt: ?*BunRuntime) callconv(.c) i64 {
+    const runtime = rt orelse return -1;
+    return TickContext.getWaitHintMs(runtime);
+}
+
 pub export fn bun_wakeup(rt: ?*BunRuntime) callconv(.c) void {
     const runtime = rt orelse return;
     if (runtime.vm.event_loop_handle) |loop| {
@@ -1006,8 +1057,17 @@ pub export fn bun_wakeup(rt: ?*BunRuntime) callconv(.c) void {
 /// IOCP handle (Windows), and invokes the user's callback whenever the JS
 /// event loop has ready work.
 ///
-/// POSIX: blocks in poll() on the kqueue/epoll fd — wake is instant for all
-/// event types (I/O, timers, cross-thread via loop.wakeup()).
+/// POSIX (poll + timeout + ACK):
+///   1. Compute timeout via getWaitHintMs():
+///        0 = work ready now → poll returns immediately
+///       -1 = no timers     → block indefinitely on fd
+///       >0 = ms to next timer → use as poll timeout
+///   2. Block in poll(fd, timeout) — zero CPU while idle. I/O readiness,
+///      cross-thread wakeups (loop.wakeup()), and timer expiry (timeout)
+///      all terminate the wait.
+///   3. Fire user callback → host calls SDL_PushEvent (or equivalent).
+///   4. Wait on Futex ACK until bun_run_pending_jobs() has run,
+///      preventing redundant callbacks before the host has drained work.
 ///
 /// Windows (IOCP dequeue-requeue):
 ///   1. Block in GetQueuedCompletionStatusEx(loop.iocp, …) — this is a TRUE
@@ -1017,25 +1077,47 @@ pub export fn bun_wakeup(rt: ?*BunRuntime) callconv(.c) void {
 ///      to the same IOCP → also wakes immediately.
 ///   2. Re-enqueue dequeued packets so libuv can process them later.
 ///   3. Fire user callback → host calls SDL_PushEvent (or equivalent).
-///   4. Wait on ACK event until bun_run_pending_jobs() has run, preventing
+///   4. Wait on Futex ACK until bun_run_pending_jobs() has run, preventing
 ///      the background thread from re-stealing packets before libuv sees them.
 fn watcherThread(runtime: *BunRuntime) void {
     if (comptime Environment.isPosix) {
         const loop = runtime.vm.event_loop_handle orelse return;
         const fd: i32 = loop.fd;
         while (!runtime.event_watcher_stop.load(.acquire)) {
+            // Compute wait timeout from the JS timer heap + immediate tasks.
+            const hint = TickContext.getWaitHintMs(runtime);
+            const poll_timeout: i32 = if (hint == 0)
+                0 // Work ready now; poll returns immediately.
+            else if (hint < 0)
+                std.math.maxInt(i32) // No timers; block until I/O or wakeup.
+            else
+                @intCast(@min(hint, std.math.maxInt(i32)));
+
             var pfd = [1]std.posix.pollfd{.{
                 .fd = fd,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
-            // Block until real loop activity arrives. stopEventWatcher() uses
-            // loop.wakeup() to break this wait immediately during shutdown.
-            const n = std.posix.poll(&pfd, std.math.maxInt(i32)) catch 0;
-            if (n > 0 and !runtime.event_watcher_stop.load(.acquire)) {
-                if (runtime.event_callback_fn) |cb| {
-                    cb(runtime.event_callback_userdata);
-                }
+            const n = std.posix.poll(&pfd, poll_timeout) catch 0;
+
+            if (runtime.event_watcher_stop.load(.acquire)) break;
+
+            // Notify when: poll returned ready events (n > 0), OR
+            // the timeout expired and there was a non-negative hint (timer due).
+            const should_notify = (n > 0) or (n == 0 and hint >= 0);
+            if (!should_notify) continue;
+
+            if (runtime.event_callback_fn) |cb| {
+                cb(runtime.event_callback_userdata);
+            }
+
+            // Mark that we are waiting for ACK, then block until
+            // bun_run_pending_jobs() signals us. This prevents redundant
+            // callbacks while the host is still draining work.
+            runtime.event_watcher_needs_ack.store(true, .release);
+            runtime.event_watcher_ack.store(0, .release);
+            while (runtime.event_watcher_ack.load(.acquire) == 0) {
+                Futex.wait(&runtime.event_watcher_ack, 0);
             }
         }
     } else {
@@ -1043,9 +1125,6 @@ fn watcherThread(runtime: *BunRuntime) void {
         const uv = bun.windows.libuv;
         const w = std.os.windows;
         const loop = runtime.vm.event_loop_handle orelse return;
-        // event_watcher_win_handle is the ACK event (auto-reset), signaled by
-        // bun_run_pending_jobs() after each tick so we don't re-steal packets.
-        const ack_event = runtime.event_watcher_win_handle orelse return;
 
         while (!runtime.event_watcher_stop.load(.acquire)) {
             // uv_backend_timeout: 0=work ready now, N>0=ms to next timer, -1=no timers.
@@ -1114,10 +1193,13 @@ fn watcherThread(runtime: *BunRuntime) void {
                 cb(runtime.event_callback_userdata);
             }
 
-            // Wait for bun_run_pending_jobs() to finish before looping.
-            // This prevents us from immediately re-dequeuing the same packets
-            // with GetQueuedCompletionStatusEx before libuv has processed them.
-            _ = w.kernel32.WaitForSingleObject(ack_event, w.INFINITE);
+            // Mark that we are waiting for ACK, then block until
+            // bun_run_pending_jobs() signals us.
+            runtime.event_watcher_needs_ack.store(true, .release);
+            runtime.event_watcher_ack.store(0, .release);
+            while (runtime.event_watcher_ack.load(.acquire) == 0) {
+                Futex.wait(&runtime.event_watcher_ack, 0);
+            }
         }
     }
 }
@@ -1130,22 +1212,14 @@ fn stopEventWatcher(runtime: *BunRuntime) void {
 
     if (runtime.vm.event_loop_handle) |loop| loop.wakeup();
 
-    if (comptime Environment.isWindows) {
-        // Wake the background thread's secondary blocking point:
-        // WaitForSingleObject(ack_event) — signal the ACK event directly.
-        if (runtime.event_watcher_win_handle) |h| _ = win32.SetEvent(h);
-    }
+    // Wake the watcher thread's secondary blocking point (Futex wait
+    // after firing the callback) so it can observe the stop flag.
+    runtime.event_watcher_ack.store(1, .release);
+    Futex.wake(&runtime.event_watcher_ack, 1);
 
     runtime.event_watcher_thread.?.join();
     runtime.event_watcher_thread = null;
     runtime.event_watcher_stop.store(false, .release);
-
-    if (comptime Environment.isWindows) {
-        if (runtime.event_watcher_win_handle) |h| {
-            std.os.windows.CloseHandle(h);
-            runtime.event_watcher_win_handle = null;
-        }
-    }
 }
 
 pub export fn bun_set_event_callback(
@@ -1163,29 +1237,13 @@ pub export fn bun_set_event_callback(
 
     if (cb == null) return;
 
-    // Prepare platform-specific resources before spawning the thread.
-    if (comptime Environment.isWindows) {
-        // Auto-reset event (bManualReset=FALSE), initially non-signaled.
-        const h = win32.CreateEventW(null, 0, 0, null);
-        if (h == null) return; // Win32 event creation failed; skip watcher.
-        runtime.event_watcher_win_handle = h;
-    }
-
     runtime.event_watcher_stop.store(false, .release);
+    runtime.event_watcher_ack.store(0, .release);
     runtime.event_watcher_thread = std.Thread.spawn(
         .{ .allocator = bun.default_allocator },
         watcherThread,
         .{runtime},
-    ) catch {
-        // Thread creation failed; release the Win32 event if we made one.
-        if (comptime Environment.isWindows) {
-            if (runtime.event_watcher_win_handle) |h| {
-                std.os.windows.CloseHandle(h);
-                runtime.event_watcher_win_handle = null;
-            }
-        }
-        return;
-    };
+    ) catch return;
 }
 
 // ---------------------------------------------------------------------------
@@ -2012,6 +2070,7 @@ comptime {
     _ = &bun_eval_file;
     _ = &bun_run_pending_jobs;
     _ = &bun_get_event_fd;
+    _ = &bun_get_wait_hint;
     _ = &bun_wakeup;
     _ = &bun_set_event_callback;
     _ = &bun_bool;

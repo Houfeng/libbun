@@ -268,39 +268,121 @@ BunValue bun_eval_file(BunContext* ctx, const char* path, size_t path_len);
 // --------------------------------------------------------------------------
 // Event Loop Integration
 // --------------------------------------------------------------------------
+//
+// Three integration modes — pick the one that matches your host application:
+//
+// ┌──────────────────────────────────────────────────────────────────────┐
+// │ Mode A — Callback-driven  (recommended for GUI apps: SDL, GTK, Qt) │
+// ├──────────────────────────────────────────────────────────────────────┤
+// │ Use bun_set_event_callback() to register a callback.  An internal  │
+// │ background thread monitors I/O + timers and invokes your callback   │
+// │ (from the background thread) whenever work is ready.  Your callback │
+// │ should wake the main thread via a thread-safe mechanism.            │
+// │                                                                     │
+// │   // Setup (once):                                                  │
+// │   void on_bun_ready(void* ud) {                                    │
+// │       SDL_Event ev = { .type = SDL_USEREVENT };                    │
+// │       SDL_PushEvent(&ev);  // thread-safe                          │
+// │   }                                                                │
+// │   bun_set_event_callback(rt, on_bun_ready, NULL);                  │
+// │                                                                     │
+// │   // Main loop:                                                     │
+// │   while (running) {                                                │
+// │       SDL_WaitEvent(&ev);  // blocks; Bun callback wakes us        │
+// │       handle_sdl_event(ev);                                        │
+// │       BunPendingJobsResult r;                                      │
+// │       while ((r = bun_run_pending_jobs(rt)) == BUN_PENDING_JOBS_SPIN) {}│
+// │   }                                                                │
+// │                                                                     │
+// │ Zero CPU while idle. Sub-ms latency for I/O, wakeups, and timers.  │
+// │ Works on all platforms (POSIX + Windows).                           │
+// └──────────────────────────────────────────────────────────────────────┘
+//
+// ┌──────────────────────────────────────────────────────────────────────┐
+// │ Mode B — fd merge  (custom event loops with their own poll/epoll)   │
+// ├──────────────────────────────────────────────────────────────────────┤
+// │ Add bun_get_event_fd() to your existing poll set and use            │
+// │ bun_get_wait_hint() as the timeout so JS timers fire on time.      │
+// │ POSIX only — returns -1 on Windows.                                │
+// │                                                                     │
+// │   int bun_fd = bun_get_event_fd(rt);                               │
+// │   struct pollfd fds[2] = {                                         │
+// │       { .fd = my_app_fd, .events = POLLIN },                      │
+// │       { .fd = bun_fd,    .events = POLLIN },                      │
+// │   };                                                                │
+// │   while (running) {                                                │
+// │       int64_t hint = bun_get_wait_hint(rt);                        │
+// │       int tmo = (hint < 0) ? my_default_tmo : (int)hint;          │
+// │       poll(fds, 2, tmo);                                           │
+// │       if (fds[0].revents) handle_app_events();                     │
+// │       BunPendingJobsResult r;                                      │
+// │       while ((r = bun_run_pending_jobs(rt)) == BUN_PENDING_JOBS_SPIN) {}│
+// │   }                                                                │
+// └──────────────────────────────────────────────────────────────────────┘
+//
+// ┌──────────────────────────────────────────────────────────────────────┐
+// │ Mode C — Frame-driven polling  (game loops with fixed vsync/tick)   │
+// ├──────────────────────────────────────────────────────────────────────┤
+// │ Call bun_run_pending_jobs() once per frame.  No fd, no callback.   │
+// │ Timer precision equals your frame interval (~16ms at 60 fps).      │
+// │ Simplest integration but highest latency.                           │
+// │                                                                     │
+// │   while (running) {                                                │
+// │       // ... input, update, render ...                             │
+// │       BunPendingJobsResult r;                                      │
+// │       while ((r = bun_run_pending_jobs(rt)) == BUN_PENDING_JOBS_SPIN) {}│
+// │       present_frame();                                             │
+// │   }                                                                │
+// └──────────────────────────────────────────────────────────────────────┘
 
-/// Drive the Bun event loop non-blockingly. Call this periodically in your GUI
-/// main loop to process pending timers, promises, I/O callbacks, etc.
+/// Drive the Bun event loop non-blockingly. Call this from your main thread
+/// to process pending timers, promises, I/O callbacks, etc.
 ///
-/// This performs a single non-blocking tick: it processes all currently ready
-/// events and returns immediately. It will NOT block waiting for new events.
+/// Performs a single non-blocking tick: processes all currently ready events
+/// and returns immediately.  It will NOT block waiting for new events.
 ///
 /// Return-value semantics:
-///   - BUN_PENDING_JOBS_IDLE: fully idle.
-///   - BUN_PENDING_JOBS_SPIN: more work is runnable immediately; call again now.
-///   - BUN_PENDING_JOBS_WAIT: the runtime is still active, but you should wait
-///     for the next host wakeup instead of busy-looping.
-///
-/// Typical GUI integration:
-///   - SPIN: keep draining in a bounded inner loop.
-///   - WAIT: return to the GUI loop and wait for bun_get_event_fd() or
-///     bun_set_event_callback() to wake you.
-///   - IDLE: runtime is quiescent.
+///   - BUN_PENDING_JOBS_IDLE: fully idle — no active handles or pending work.
+///   - BUN_PENDING_JOBS_SPIN: more work is runnable immediately; call again.
+///   - BUN_PENDING_JOBS_WAIT: runtime is active but waiting for I/O or timers;
+///     return to your host loop.
 ///
 /// @param rt  Runtime handle.
 /// @return    Tri-state result describing whether to stop, spin, or wait.
 BunPendingJobsResult bun_run_pending_jobs(BunRuntime* rt);
 
 /// Get the underlying OS event loop file descriptor (epoll fd on Linux,
-/// kqueue fd on macOS). You can monitor this fd with poll()/select() or your
-/// GUI framework's I/O source (e.g. CFFileDescriptor, GSource) and call
-/// bun_run_pending_jobs() when it becomes readable.
+/// kqueue fd on macOS).  The fd becomes readable when I/O is ready or
+/// bun_wakeup()/bun_call_async() is called from another thread.
+///
+/// JS timers are NOT signaled through this fd — use bun_get_wait_hint() as
+/// the timeout when polling so timers fire on time.
 ///
 /// Returns -1 on Windows (IOCP has no pollable fd) or if unavailable.
+/// Intended for Mode B (fd merge) integration only.
 ///
-/// Cross-platform alternative: bun_set_event_callback() works on all
-/// platforms including Windows and does not require manual fd polling.
+/// @param rt  Runtime handle.
+/// @return    Pollable fd, or -1 if unavailable.
 int bun_get_event_fd(BunRuntime* rt);
+
+/// Return the recommended wait timeout in milliseconds for the embed host.
+///
+/// Call this before blocking in your poll/select to determine how long to
+/// wait before the next JS timer fires.
+///
+/// Return values:
+///    0  — work is runnable right now; call bun_run_pending_jobs() immediately.
+///   -1  — no JS timers pending; wait indefinitely on I/O / bun_wakeup().
+///   >0  — milliseconds until the next JS timer fires; use as poll/select
+///         timeout on the fd from bun_get_event_fd().
+///
+/// Intended for Mode B (fd merge) integration.
+/// In Mode A (callback), the internal watcher thread uses this automatically.
+/// In Mode C (frame-driven), this is not needed.
+///
+/// @param rt  Runtime handle.
+/// @return    Timeout in ms, 0 for immediate, -1 for indefinite.
+int64_t bun_get_wait_hint(BunRuntime* rt);
 
 /// Thread-safe: wake up the event loop from any thread. After calling this,
 /// the next bun_run_pending_jobs() will process any concurrently queued work.
@@ -309,53 +391,38 @@ int bun_get_event_fd(BunRuntime* rt);
 /// call, so there is no need to follow bun_call_async() with bun_wakeup().
 void bun_wakeup(BunRuntime* rt);
 
-/// Callback invoked from a Bun-internal background thread when the runtime has
-/// ready work and the host loop should be woken (e.g. SDL_PushEvent,
-/// PostMessage, …).
+/// Callback type invoked from Bun's internal background thread when the
+/// runtime has ready work.
 ///
-/// THREAD SAFETY: Invoked from a background thread, NOT from the host's main
-/// thread. The callback must be thread-safe.
+/// THREAD SAFETY: Called from a background thread, NOT the host's main thread.
+/// The callback MUST be thread-safe — use SDL_PushEvent, PostMessage,
+/// write(pipe_fd, …), pthread_cond_signal, etc. to wake your main thread.
 ///
-/// Intended use: signal or wake the host loop, then call
-/// bun_run_pending_jobs() later from the runtime's owning thread.
+/// The callback fires at most once per batch: after firing, the watcher waits
+/// for bun_run_pending_jobs() to acknowledge before notifying again.
 ///
 /// @param userdata  The pointer passed to bun_set_event_callback().
 typedef void (*BunEventCallback)(void* userdata);
 
-/// Set the event-ready callback used to wake the host loop, replacing any
-/// previously set one.
+/// Register a callback to wake the host loop when work is ready (Mode A).
 ///
-/// Starts an internal background thread that monitors the event loop.
-/// Each call immediately stops the previous background thread (if any) and
-/// starts a new one — only the most recently set callback is ever active.
-/// Prefer calling this once at startup rather than repeatedly.
-/// Pass NULL for cb to stop monitoring without starting a new thread.
+/// Starts an internal background thread that monitors all event sources
+/// (I/O, timers, cross-thread wakeups) and calls your callback whenever
+/// the runtime transitions from idle to having ready work.
 ///
-/// POSIX (Linux / macOS):
-///   The thread blocks on the kernel event fd (epoll on Linux, kqueue on
-///   macOS) via poll(). Zero CPU while idle. All event types — I/O, timers,
-///   and cross-thread wakeups (bun_wakeup → loop.wakeup()) — are delivered
-///   through the same fd, so the callback fires with near-zero latency when
-///   real work arrives. The watcher does not use a periodic idle timeout;
-///   callback replacement / shutdown wakes the loop explicitly to break the
-///   blocking poll immediately.
+/// The background thread blocks on OS primitives — zero CPU while idle:
+///   POSIX:   poll(kqueue/epoll fd, timer_timeout)
+///   Windows: GetQueuedCompletionStatusEx(IOCP, timer_timeout)
+/// All event types are covered with sub-millisecond latency.
 ///
-/// Windows (IOCP dequeue-requeue):
-///   The thread blocks on libuv's internal IOCP handle via
-///   GetQueuedCompletionStatusEx(). This is a true OS-level blocking wait —
-///   zero CPU while idle. Work-ready conditions are detected as follows:
-///     • Network / file I/O  → OS posts IOCP completion → immediate wake
-///     • bun_wakeup()        → uv_async_send posts synthetic IOCP → immediate
-///     • Timers              → uv_backend_timeout() used as IOCP deadline →
-///                             exact to the millisecond
-///   Indefinite idle waits do NOT generate periodic callbacks. If the watcher
-///   dequeues IOCP packets, it re-enqueues them via PostQueuedCompletionStatus
-///   so libuv processes them normally, then fires the callback, and waits for
-///   bun_run_pending_jobs() to signal an ACK event before resuming the next
-///   blocking wait.
+/// Lifecycle:
+///   - Each call stops the previous background thread (if any) and starts
+///     a new one.  Only the most recently set callback is active.
+///   - Pass NULL for cb to stop monitoring without starting a new thread.
+///   - Prefer calling once at startup.
 ///
 /// @param rt        Runtime handle.
-/// @param cb        Callback invoked when work is ready (NULL to unregister).
+/// @param cb        Callback invoked when work is ready (NULL to stop).
 /// @param userdata  Forwarded verbatim to the callback.
 void bun_set_event_callback(BunRuntime* rt, BunEventCallback cb, void* userdata);
 

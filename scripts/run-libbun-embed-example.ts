@@ -77,6 +77,16 @@ if (process.platform !== "win32") {
         }
       },
     },
+    {
+      name: "embed wait_hint and callback regression",
+      sourceFile: resolve(repoRoot, "src/embed/test/test_wait_hint.c"),
+      executableName: "embed-wait-hint-regression",
+      validateOutput(output) {
+        if (output.includes("[FAIL]")) {
+          throw new Error("test_wait_hint reported a failure");
+        }
+      },
+    },
   );
 }
 
