@@ -845,12 +845,26 @@ pub export fn bun_run_pending_jobs(rt: ?*BunRuntime) callconv(.c) BunPendingJobs
     // safely resume its blocking wait (poll on POSIX, IOCP on Windows).
     // Only post ACK if the watcher has actually notified us and is waiting;
     // this prevents stale ACKs from accumulating.
-    if (runtime.event_watcher_thread != null and
-        !runtime.event_watcher_stop.load(.acquire) and
-        runtime.event_watcher_needs_ack.swap(false, .acq_rel))
-    {
+    const has_watcher = runtime.event_watcher_thread != null and
+        !runtime.event_watcher_stop.load(.acquire);
+    if (has_watcher and runtime.event_watcher_needs_ack.swap(false, .acq_rel)) {
         runtime.event_watcher_ack.store(1, .release);
         Futex.wake(&runtime.event_watcher_ack, 1);
+    } else if (has_watcher) {
+        // Watcher is in its sleep phase (Futex or poll/IOCP), not in
+        // ACK-wait.  Wake it so it re-evaluates its timeout — new timers
+        // or tasks may have been registered during this tick.
+        //
+        // Futex.wake without storing a non-zero value means the watcher
+        // will see watcher_wake_futex == 0 when it checks should_notify,
+        // so it won't fire a spurious callback — it just re-computes its
+        // wait hint and re-enters sleep with the correct timeout.
+        Futex.wake(&runtime.watcher_wake_futex, 1);
+        // Also poke the event loop fd so the watcher wakes from poll()
+        // (POSIX) or GetQueuedCompletionStatusEx() (Windows).
+        if (runtime.vm.event_loop_handle) |loop| {
+            loop.wakeup();
+        }
     }
     return tick_ctx.result;
 }
