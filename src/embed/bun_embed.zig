@@ -926,37 +926,36 @@ const TickContext = struct {
     /// thread. It acquires the timer lock to peek at the heap and does not
     /// mutate state (unlike Timer.All.getTimeout which has side effects).
     fn getWaitHintMs(runtime: *BunRuntime) i64 {
-        // Use hasQueuedTaskWork (no fd poll) instead of
-        // hasImmediateProgressAvailable. Polling the kqueue/epoll fd
-        // produces false positives from internal fallthrough events
-        // (GC repeating timer) that tickWithoutIdle never consumes
-        // when num_polls == 0.
+        // Use hasQueuedTaskWork (no fd poll / no uv_backend_timeout) to
+        // avoid false positives from internal housekeeping events:
+        //   POSIX  — GC EVFILT_TIMER makes kqueue fd permanently readable
+        //            when num_polls == 0.
+        //   Windows — uv_backend_timeout() returns 0 when only unref'd
+        //            handles (GC timer) are active, because the
+        //            uv__has_active_handles check fails and the function
+        //            short-circuits to `return 0`.
+        // Peeking the Zig timer heap directly (cross-platform) gives an
+        // accurate picture of real JS work without these false positives.
         if (hasQueuedTaskWork(runtime)) return 0;
 
         const vm = runtime.vm;
-        if (comptime Environment.isPosix) {
-            // Check immediate_tasks first (same as getTimeout, no lock needed).
-            if (vm.event_loop.immediate_tasks.items.len > 0) return 0;
 
-            // Peek the timer heap under lock — do NOT use getTimeout() because
-            // it has side effects (fires WTFTimer) that are unsafe from the
-            // background watcher thread.
-            const timers = &vm.timer;
-            timers.lock.lock();
-            defer timers.lock.unlock();
+        // Check immediate_tasks first (no lock needed).
+        if (vm.eventLoop().immediate_tasks.items.len > 0) return 0;
 
-            const min = timers.timers.peek() orelse return -1;
-            const now = bun.timespec.now(.allow_mocked_time);
-            if (!min.next.greater(&now)) return 0; // timer already due
-            const spec = min.next.duration(&now);
-            const ms: i64 = spec.sec * 1000 + @divTrunc(spec.nsec, 1_000_000);
-            return if (ms <= 0) 1 else ms;
-        } else {
-            if (vm.event_loop_handle) |loop| {
-                return bun.windows.libuv.uv_backend_timeout(loop);
-            }
-            return -1;
-        }
+        // Peek the timer heap under lock — do NOT use getTimeout() because
+        // it has side effects (fires WTFTimer) that are unsafe from the
+        // background watcher thread.
+        const timers = &vm.timer;
+        timers.lock.lock();
+        defer timers.lock.unlock();
+
+        const min = timers.timers.peek() orelse return -1;
+        const now = bun.timespec.now(.allow_mocked_time);
+        if (!min.next.greater(&now)) return 0; // timer already due
+        const spec = min.next.duration(&now);
+        const ms: i64 = spec.sec * 1000 + @divTrunc(spec.nsec, 1_000_000);
+        return if (ms <= 0) 1 else ms;
     }
 
     fn drainPendingCalls(runtime: *BunRuntime, global: *JSGlobalObject) void {
@@ -1159,21 +1158,21 @@ fn watcherThread(runtime: *BunRuntime) void {
         }
     } else {
         // Windows: true IOCP blocking — zero CPU, zero I/O latency.
-        const uv = bun.windows.libuv;
         const w = std.os.windows;
         const loop = runtime.vm.event_loop_handle orelse return;
 
         while (!runtime.event_watcher_stop.load(.acquire)) {
-            // uv_backend_timeout: 0=work ready now, N>0=ms to next timer, -1=no timers.
-            // Use the exact libuv deadline so timeout-based wakeups only happen
-            // when work is actually due, instead of every fixed polling interval.
-            const timeout_raw = uv.uv_backend_timeout(loop);
-            const timeout_ms: w.DWORD = if (timeout_raw == 0)
+            // Use getWaitHintMs (Zig timer heap) instead of
+            // uv_backend_timeout.  The latter returns 0 when only
+            // unref'd handles (GC timer) are active, causing a
+            // tight-loop of 0-timeout IOCP calls.
+            const hint = TickContext.getWaitHintMs(runtime);
+            const timeout_ms: w.DWORD = if (hint == 0)
                 0 // Work is already ready; return instantly from IOCP call.
-            else if (timeout_raw < 0)
+            else if (hint < 0)
                 w.INFINITE // No timers pending; wait for real I/O or uv_async wakeup.
             else
-                @intCast(timeout_raw);
+                @intCast(@min(hint, std.math.maxInt(w.DWORD)));
 
             // Block here until real I/O completes (IOCP), a timer deadline
             // arrives (timeout_ms expiry), or bun_wakeup() posts a synthetic
@@ -1203,10 +1202,15 @@ fn watcherThread(runtime: *BunRuntime) void {
                 break;
             }
 
+            // Real IOCP completions (rc != 0) always indicate genuine
+            // I/O work or an explicit bun_wakeup().  On timeout, only
+            // notify when getWaitHintMs indicated a JS timer was due
+            // (hint >= 0) or queued tasks appeared in the meantime.
             const should_notify = if (rc != 0)
                 true
             else switch (w.kernel32.GetLastError()) {
-                .TIMEOUT, .WAIT_TIMEOUT => timeout_raw >= 0,
+                .TIMEOUT, .WAIT_TIMEOUT => (hint >= 0) or
+                    TickContext.hasQueuedTaskWork(runtime),
                 else => false,
             };
 
