@@ -10,6 +10,8 @@ const JSGlobalObject = jsc.JSGlobalObject;
 const JSValue = jsc.JSValue;
 const Environment = bun.Environment;
 const api = bun.schema.api;
+const EventLoopTimer = bun.api.Timer.EventLoopTimer;
+const TimerHeap = bun.api.Timer.TimerHeap;
 
 const BunValue = u64;
 const BunContext = opaque {};
@@ -178,6 +180,18 @@ const BunRuntime = struct {
     /// is waiting for ACK. Checked by bun_run_pending_jobs() to avoid posting
     /// a stale ACK when the watcher hasn't actually notified the host yet.
     event_watcher_needs_ack: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Futex used to sleep the watcher thread when num_polls == 0 (POSIX).
+    /// When the kqueue/epoll fd has no real I/O polls, internal housekeeping
+    /// events (GC EVFILT_TIMER, machport) make it permanently readable,
+    /// preventing poll() from blocking.  This futex provides an alternative
+    /// blocking mechanism: 0 = sleeping, 1 = woken.
+    /// bun_wakeup() and bun_call_async() signal this alongside loop.wakeup().
+    watcher_wake_futex: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// True when user-level I/O operations are in flight (fetch, TCP,
+    /// WebSocket, etc.). Set at the end of each bun_run_pending_jobs tick
+    /// based on vm.active_tasks > 0. The watcher thread reads this to
+    /// decide between poll() (I/O pending) and Futex (idle/timers only).
+    watcher_io_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn setLastErrorBytes(runtime: *BunRuntime, bytes: []const u8) void {
         const err_str = bun.default_allocator.allocSentinel(u8, bytes.len, 0) catch return;
@@ -824,6 +838,9 @@ pub export fn bun_run_pending_jobs(rt: ?*BunRuntime) callconv(.c) BunPendingJobs
     const runtime = rt orelse return .idle;
     var tick_ctx = TickContext{ .runtime = runtime, .result = .idle };
     runtime.vm.runWithAPILock(TickContext, &tick_ctx, TickContext.run);
+    // Publish whether user-level I/O is in flight so the watcher thread
+    // can adapt its strategy (poll for I/O, Futex for timers-only).
+    runtime.watcher_io_pending.store(runtime.vm.active_tasks > 0, .release);
     // Signal the watcher thread that we have finished processing so it can
     // safely resume its blocking wait (poll on POSIX, IOCP on Windows).
     // Only post ACK if the watcher has actually notified us and is waiting;
@@ -853,7 +870,7 @@ const TickContext = struct {
         timers.lock.lock();
         defer timers.lock.unlock();
 
-        const timer = timers.timers.peek() orelse return false;
+        const timer = findMinUserTimer(&timers.timers) orelse return false;
         const now = bun.timespec.now(.allow_mocked_time);
         return !timer.next.greater(&now);
     }
@@ -926,36 +943,97 @@ const TickContext = struct {
     /// thread. It acquires the timer lock to peek at the heap and does not
     /// mutate state (unlike Timer.All.getTimeout which has side effects).
     fn getWaitHintMs(runtime: *BunRuntime) i64 {
-        // Use hasQueuedTaskWork (no fd poll / no uv_backend_timeout) to
-        // avoid false positives from internal housekeeping events:
-        //   POSIX  — GC EVFILT_TIMER makes kqueue fd permanently readable
-        //            when num_polls == 0.
-        //   Windows — uv_backend_timeout() returns 0 when only unref'd
-        //            handles (GC timer) are active, because the
-        //            uv__has_active_handles check fails and the function
-        //            short-circuits to `return 0`.
-        // Peeking the Zig timer heap directly (cross-platform) gives an
-        // accurate picture of real JS work without these false positives.
-        if (hasQueuedTaskWork(runtime)) return 0;
+        // DO NOT check hasQueuedTaskWork() here.  After a bun_run_pending_jobs
+        // drains the event loop, residual internal state (after_event_loop_callback
+        // from deferred FilePoll frees, pending_unref_counter, concurrent_tasks
+        // from JSC GC finalizers, etc.) can linger without representing new
+        // user-visible JS work.  Checking those fields would make the watcher
+        // immediately re-fire after every ACK, defeating the purpose of the
+        // timeout-based sleep.
+        //
+        // The watcher only needs to know:
+        //   1. When the next user timer fires (timer heap peek below).
+        //   2. Whether an explicit wakeup was signaled (Futex / eventfd).
+        // Both are handled correctly without hasQueuedTaskWork.
+        //
+        // Cross-thread work (bun_call_async, concurrent_tasks) is covered
+        // by Futex signaling (bun_call_async signals watcher_wake_futex)
+        // or the uSockets eventfd wakeup (which makes the kqueue/epoll fd
+        // readable and is detected by the poll path when num_polls > 0).
 
         const vm = runtime.vm;
-
-        // Check immediate_tasks first (no lock needed).
-        if (vm.eventLoop().immediate_tasks.items.len > 0) return 0;
 
         // Peek the timer heap under lock — do NOT use getTimeout() because
         // it has side effects (fires WTFTimer) that are unsafe from the
         // background watcher thread.
+        // Skip embed-internal timers (e.g. JSC's WTFTimer for GC scheduling)
+        // that fire periodically but do not represent user-visible JS work.
         const timers = &vm.timer;
         timers.lock.lock();
         defer timers.lock.unlock();
 
-        const min = timers.timers.peek() orelse return -1;
+        const min = findMinUserTimer(&timers.timers) orelse return -1;
         const now = bun.timespec.now(.allow_mocked_time);
         if (!min.next.greater(&now)) return 0; // timer already due
         const spec = min.next.duration(&now);
         const ms: i64 = spec.sec * 1000 + @divTrunc(spec.nsec, 1_000_000);
         return if (ms <= 0) 1 else ms;
+    }
+
+    /// Returns true for timers that are VM-internal housekeeping
+    /// (e.g. JSC's WTFTimer for GC scheduling) and should NOT be
+    /// treated as user-visible JS work by the embed event watcher.
+    fn isEmbedInternalTimer(tag: EventLoopTimer.Tag) bool {
+        return tag == .WTFTimer;
+    }
+
+    /// Find the earliest timer in the heap that is NOT embed-internal
+    /// (e.g. JSC's WTFTimer).  Returns null if no user timer exists.
+    /// Must be called with the timer lock held.
+    fn findMinUserTimer(timers: *const TimerHeap) ?*EventLoopTimer {
+        const root = timers.root orelse return null;
+        // Fast path: most of the time the root is a user timer.
+        if (!isEmbedInternalTimer(root.tag)) return root;
+
+        // Slow path: root is internal — traverse the pairing heap to find
+        // the minimum non-internal timer.  Timer counts are typically small
+        // (< 100) so a full traversal is acceptable.
+        return findMinUserTimerWalk(root);
+    }
+
+    fn findMinUserTimerWalk(start: *EventLoopTimer) ?*EventLoopTimer {
+        var best: ?*EventLoopTimer = null;
+        // Iterative DFS over the pairing heap using a bounded stack.
+        var stack: [64]*EventLoopTimer = undefined;
+        var sp: usize = 1;
+        stack[0] = start;
+
+        while (sp > 0) {
+            sp -= 1;
+            const node = stack[sp];
+
+            if (!isEmbedInternalTimer(node.tag)) {
+                if (best == null or EventLoopTimer.less({}, node, best.?)) {
+                    best = node;
+                }
+            }
+
+            // Push child and sibling.  Order doesn't matter for correctness.
+            if (node.heap.child) |child| {
+                if (sp < stack.len) {
+                    stack[sp] = child;
+                    sp += 1;
+                }
+            }
+            if (node.heap.next) |next| {
+                if (sp < stack.len) {
+                    stack[sp] = next;
+                    sp += 1;
+                }
+            }
+        }
+
+        return best;
     }
 
     fn drainPendingCalls(runtime: *BunRuntime, global: *JSGlobalObject) void {
@@ -1023,6 +1101,11 @@ const TickContext = struct {
         event_loop.tick();
         vm.global.handleRejectedPromises();
 
+        // Drain any after-event-loop callbacks (e.g. deferred FilePoll frees
+        // from GC) that were scheduled during the second tick above, so they
+        // don't cause hasQueuedTaskWork to return true spuriously.
+        vm.onAfterEventLoop();
+
         this.result = if (hasQueuedTaskWork(this.runtime))
             .spin
         else if (hasFuturePendingWork(this.runtime))
@@ -1054,6 +1137,13 @@ pub export fn bun_get_event_fd(rt: ?*BunRuntime) callconv(.c) c_int {
 ///  >0  = milliseconds until the next JS timer fires; use as poll/select timeout.
 pub export fn bun_get_wait_hint(rt: ?*BunRuntime) callconv(.c) i64 {
     const runtime = rt orelse return -1;
+    // Check immediate tasks — these are only valid on the main thread
+    // (which is the only context where bun_get_wait_hint should be called).
+    // The watcher thread's getWaitHintMs intentionally skips these to avoid
+    // spurious callbacks from residual internal state.
+    const event_loop = runtime.vm.eventLoop();
+    if (event_loop.immediate_tasks.items.len > 0 or
+        event_loop.next_immediate_tasks.items.len > 0) return 0;
     return TickContext.getWaitHintMs(runtime);
 }
 
@@ -1068,6 +1158,9 @@ pub export fn bun_wakeup(rt: ?*BunRuntime) callconv(.c) void {
         // bun_call_async().
         loop.wakeup();
     }
+    // Also signal the Futex-based watcher path (POSIX, when num_polls == 0).
+    runtime.watcher_wake_futex.store(1, .release);
+    Futex.wake(&runtime.watcher_wake_futex, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1078,17 +1171,21 @@ pub export fn bun_wakeup(rt: ?*BunRuntime) callconv(.c) void {
 /// IOCP handle (Windows), and invokes the user's callback whenever the JS
 /// event loop has ready work.
 ///
-/// POSIX (poll + timeout + ACK):
-///   1. Compute timeout via getWaitHintMs():
-///        0 = work ready now → poll returns immediately
-///       -1 = no timers     → block indefinitely on fd
-///       >0 = ms to next timer → use as poll timeout
-///   2. Block in poll(fd, timeout) — zero CPU while idle. I/O readiness,
-///      cross-thread wakeups (loop.wakeup()), and timer expiry (timeout)
-///      all terminate the wait.
-///   3. Fire user callback → host calls SDL_PushEvent (or equivalent).
-///   4. Wait on Futex ACK until bun_run_pending_jobs() has run,
-///      preventing redundant callbacks before the host has drained work.
+/// POSIX (hybrid poll/Futex + timeout + ACK):
+///   Strategy adapts based on `last_tick_result` from bun_run_pending_jobs:
+///
+///   - **I/O pending** (result == .wait): poll() on the kqueue/epoll fd for
+///     0-latency I/O detection (TCP data, fetch response, WebSocket message).
+///     Internal noise (Mach port, GC timer) may cause extra wakeups, but each
+///     is rate-limited by the ACK round-trip through the host's message pump.
+///
+///   - **Idle / no I/O** (result == .idle or .spin): pure Futex sleep, immune
+///     to kqueue/epoll internal noise.  Zero CPU cost while idle.  Woken only
+///     by bun_wakeup() / bun_call_async() (via Futex) or timer expiry.
+///
+///   Timer deadlines always come from getWaitHintMs() (Zig timer heap, skips
+///   embed-internal timers like WTFTimer) and are used as the poll/Futex
+///   timeout, so JS timers fire on time in both modes.
 ///
 /// Windows (IOCP dequeue-requeue):
 ///   1. Block in GetQueuedCompletionStatusEx(loop.iocp, …) — this is a TRUE
@@ -1102,45 +1199,92 @@ pub export fn bun_wakeup(rt: ?*BunRuntime) callconv(.c) void {
 ///      the background thread from re-stealing packets before libuv sees them.
 fn watcherThread(runtime: *BunRuntime) void {
     if (comptime Environment.isPosix) {
-        const loop = runtime.vm.event_loop_handle orelse return;
-        const fd: i32 = loop.fd;
         while (!runtime.event_watcher_stop.load(.acquire)) {
-            // Compute wait timeout from the JS timer heap + immediate tasks.
+            // Compute wait timeout from the JS timer heap.
+            // getWaitHintMs excludes embed-internal timers (JSC's WTFTimer)
+            // so the timeout reflects only user-visible JS work.
             const hint = TickContext.getWaitHintMs(runtime);
-            const poll_timeout: i32 = if (hint == 0)
-                0 // Work ready now; poll returns immediately.
-            else if (hint < 0)
-                std.math.maxInt(i32) // No timers; block until I/O or wakeup.
-            else
-                @intCast(@min(hint, std.math.maxInt(i32)));
 
-            var pfd = [1]std.posix.pollfd{.{
-                .fd = fd,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const n = std.posix.poll(&pfd, poll_timeout) catch 0;
+            // Determine whether I/O is in flight based on the last tick result.
+            // .wait (2) means active_tasks > 0, i.e. registered I/O handles
+            // (fetch, TCP, WebSocket, etc.) are still outstanding.
+            const io_pending = runtime.watcher_io_pending.load(.acquire);
 
-            if (runtime.event_watcher_stop.load(.acquire)) break;
+            var should_notify = false;
 
-            // Determine whether the host should tick.
-            //
-            // When poll reports readiness (n > 0) it might be real I/O
-            // OR an internal fallthrough event (GC repeating timer,
-            // async wakeup) whose EVFILT_TIMER / EVFILT_MACHPORT sits
-            // in kqueue but is never consumed by tickWithoutIdle when
-            // num_polls == 0.  Blindly notifying in that case causes
-            // the callback to fire in a tight loop.
-            //
-            // Rule: treat poll readiness as genuine only when real I/O
-            // polls are registered (num_polls > 0) — the subsequent
-            // bun_run_pending_jobs will call kevent64 and consume the
-            // events.  When num_polls == 0 we fall through to the task-
-            // queue / timer-heap check.
-            const has_real_io_polls = loop.num_polls > 0;
-            const should_notify = (n > 0 and has_real_io_polls) or
-                (n == 0 and hint >= 0) or
-                TickContext.hasQueuedTaskWork(runtime);
+            if (hint == 0) {
+                // Work is already due — notify immediately.
+                should_notify = true;
+            } else if (io_pending) {
+                // I/O in flight — poll on kqueue/epoll fd to detect data
+                // arrival with 0 latency.  Internal noise (Mach port
+                // wakeup messages, GC EVFILT_TIMER, sweep timer) may cause
+                // extra wakeups here, but each is rate-limited by the ACK
+                // round-trip through the host's message pump (~16ms at
+                // 60fps).  Once I/O completes and bun_run_pending_jobs
+                // returns idle/spin, we switch to pure Futex below.
+                runtime.watcher_wake_futex.store(0, .release);
+
+                const poll_timeout: i32 = if (hint < 0)
+                    -1 // no timers — block until I/O or wakeup
+                else
+                    @intCast(@min(hint, std.math.maxInt(i32)));
+
+                if (runtime.vm.event_loop_handle) |loop| {
+                    var pfd = [1]std.posix.pollfd{.{
+                        .fd = loop.fd,
+                        .events = std.posix.POLL.IN,
+                        .revents = 0,
+                    }};
+                    _ = std.posix.poll(&pfd, poll_timeout) catch 0;
+
+                    if (runtime.event_watcher_stop.load(.acquire)) break;
+
+                    should_notify = (pfd[0].revents & std.posix.POLL.IN != 0) or
+                        TickContext.hasDueTimerNow(runtime.vm) or
+                        runtime.watcher_wake_futex.load(.acquire) != 0;
+                } else {
+                    // No loop handle — fall through with Futex like the
+                    // non-I/O path below.
+                    const timeout_ns: ?u64 = if (hint < 0)
+                        null
+                    else
+                        @intCast(@as(u64, @intCast(hint)) * std.time.ns_per_ms);
+
+                    if (timeout_ns) |ns| {
+                        Futex.timedWait(&runtime.watcher_wake_futex, 0, ns) catch {};
+                    } else {
+                        Futex.wait(&runtime.watcher_wake_futex, 0);
+                    }
+
+                    if (runtime.event_watcher_stop.load(.acquire)) break;
+
+                    should_notify = TickContext.hasDueTimerNow(runtime.vm) or
+                        runtime.watcher_wake_futex.load(.acquire) != 0;
+                }
+            } else {
+                // No I/O pending — pure Futex sleep, immune to kqueue/epoll
+                // internal noise.  Zero CPU cost while idle.
+                runtime.watcher_wake_futex.store(0, .release);
+                const timeout_ns: ?u64 = if (hint < 0)
+                    null // block indefinitely
+                else
+                    @intCast(@as(u64, @intCast(hint)) * std.time.ns_per_ms);
+
+                if (timeout_ns) |ns| {
+                    Futex.timedWait(&runtime.watcher_wake_futex, 0, ns) catch {};
+                } else {
+                    Futex.wait(&runtime.watcher_wake_futex, 0);
+                }
+
+                if (runtime.event_watcher_stop.load(.acquire)) break;
+
+                // Woken by: timeout (user timer due), futex signal
+                // (bun_wakeup / bun_call_async), or spurious wakeup.
+                should_notify = TickContext.hasDueTimerNow(runtime.vm) or
+                    runtime.watcher_wake_futex.load(.acquire) != 0;
+            }
+
             if (!should_notify) continue;
 
             if (runtime.event_callback_fn) |cb| {
@@ -1210,7 +1354,7 @@ fn watcherThread(runtime: *BunRuntime) void {
                 true
             else switch (w.kernel32.GetLastError()) {
                 .TIMEOUT, .WAIT_TIMEOUT => (hint >= 0) or
-                    TickContext.hasQueuedTaskWork(runtime),
+                    TickContext.hasDueTimerNow(runtime.vm),
                 else => false,
             };
 
@@ -1253,10 +1397,13 @@ fn stopEventWatcher(runtime: *BunRuntime) void {
 
     if (runtime.vm.event_loop_handle) |loop| loop.wakeup();
 
-    // Wake the watcher thread's secondary blocking point (Futex wait
-    // after firing the callback) so it can observe the stop flag.
+    // Wake the watcher thread from all possible blocking points:
+    // 1. Futex ACK wait (after firing callback)
     runtime.event_watcher_ack.store(1, .release);
     Futex.wake(&runtime.event_watcher_ack, 1);
+    // 2. Futex-based sleep (POSIX, when num_polls == 0)
+    runtime.watcher_wake_futex.store(1, .release);
+    Futex.wake(&runtime.watcher_wake_futex, 1);
 
     runtime.event_watcher_thread.?.join();
     runtime.event_watcher_thread = null;
@@ -2092,6 +2239,9 @@ pub export fn bun_call_async(
     if (runtime.vm.event_loop_handle) |loop| {
         loop.wakeup();
     }
+    // Also signal the Futex-based watcher path (POSIX, when num_polls == 0).
+    runtime.watcher_wake_futex.store(1, .release);
+    Futex.wake(&runtime.watcher_wake_futex, 1);
 
     return 1;
 }
