@@ -670,6 +670,22 @@ pub export fn bun_context(rt: ?*BunRuntime) callconv(.c) ?*BunContext {
 // Evaluation
 // ---------------------------------------------------------------------------
 
+/// Nudge the watcher thread so it re-computes its timeout after eval/file
+/// execution that may have registered new timers or tasks.  This is a
+/// lightweight signal: Futex.wake without storing a non-zero value, so the
+/// watcher won't fire a spurious callback — it just re-enters sleep with
+/// the correct timeout derived from getWaitHintMs().
+fn nudgeWatcher(runtime: *BunRuntime) void {
+    if (runtime.event_watcher_thread != null and
+        !runtime.event_watcher_stop.load(.acquire))
+    {
+        Futex.wake(&runtime.watcher_wake_futex, 1);
+        if (runtime.vm.event_loop_handle) |loop| {
+            loop.wakeup();
+        }
+    }
+}
+
 pub export fn bun_eval_string(ctx: ?*BunContext, code_ptr: ?[*]const u8, code_len: usize) callconv(.c) BunValue {
     const global = toGlobal(ctx) orelse return 0;
     const runtime = vmToRuntime(global.bunVM()) orelse return 0;
@@ -687,6 +703,11 @@ pub export fn bun_eval_string(ctx: ?*BunContext, code_ptr: ?[*]const u8, code_le
         .result = 0,
     };
     runtime.vm.runWithAPILock(EvalContext, &eval_ctx, EvalContext.run);
+    // Eval may have registered new timers/tasks (e.g. setTimeout).  Nudge
+    // the watcher thread so it re-computes its wait timeout, ensuring the
+    // host gets a callback at the right time even if it doesn't call
+    // bun_run_pending_jobs() immediately after eval.
+    nudgeWatcher(runtime);
     return eval_ctx.result;
 }
 
@@ -769,6 +790,8 @@ pub export fn bun_eval_file(ctx: ?*BunContext, path_ptr: ?[*]const u8, path_len:
         .result = 0,
     };
     runtime.vm.runWithAPILock(EvalFileContext, &eval_ctx, EvalFileContext.run);
+    // Same as bun_eval_string: nudge watcher for newly registered work.
+    nudgeWatcher(runtime);
     return eval_ctx.result;
 }
 
